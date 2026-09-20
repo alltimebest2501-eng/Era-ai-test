@@ -12,7 +12,7 @@ const path = require("path");
 const app = express();
 
 const PORT = process.env.PORT || 10000;
-const VERSION = "8.0.0";
+const VERSION = "8.1.2";
 
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
@@ -20,13 +20,22 @@ app.use(express.json({ limit: "2mb" }));
 // Serve the ERA test UI from the same Render service.
 app.use(express.static(path.join(__dirname, "public")));
 
+// Test deployment: serve the repository root index.html when /public is not used.
+app.get("/", (req, res) => {
+  const rootIndex = path.join(__dirname, "index.html");
+  if (fs.existsSync(rootIndex)) return res.sendFile(rootIndex);
+  const publicIndex = path.join(__dirname, "public", "index.html");
+  if (fs.existsSync(publicIndex)) return res.sendFile(publicIndex);
+  return res.status(404).send("ERA AI frontend not found");
+});
+
 // ============================================================
 // ENV
 // ============================================================
 
 const BACKEND_URL =
   process.env.BACKEND_URL ||
-  "https://era-ai.onrender.com";
+  "https://era-ai-test.onrender.com";
 
 const UPSTOX_ACCESS_TOKEN =
   process.env.UPSTOX_ACCESS_TOKEN || "";
