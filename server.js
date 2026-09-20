@@ -8,8 +8,6 @@ const axios = require("axios");
 const webpush = require("web-push");
 const fs = require("fs");
 const path = require("path");
-const crypto = require("crypto");
-const nodemailer = require("nodemailer");
 
 const app = express();
 
@@ -49,107 +47,6 @@ const VAPID_PRIVATE_KEY =
 const VAPID_SUBJECT =
   process.env.VAPID_SUBJECT ||
   "mailto:admin@era-ai.app";
-
-// ============================================================
-// AUTH CONFIG
-// ============================================================
-const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
-const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || "";
-const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || "";
-const SMTP_HOST = process.env.SMTP_HOST || "smtp.gmail.com";
-const SMTP_PORT = Number(process.env.SMTP_PORT || 465);
-const SMTP_USER = process.env.SMTP_USER || "";
-const SMTP_PASS = process.env.SMTP_PASS || "";
-const SMTP_FROM = process.env.SMTP_FROM || SMTP_USER;
-const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
-const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
-const TWILIO_FROM_NUMBER = process.env.TWILIO_FROM_NUMBER || "";
-const OTP_TTL_MS = 10 * 60 * 1000;
-const otpStore = new Map();
-
-function normalizeEmail(value) {
-  return String(value || "").trim().toLowerCase();
-}
-
-function normalizeMobile(value) {
-  const raw = String(value || "").trim();
-  const digits = raw.replace(/[^0-9+]/g, "");
-  if (digits.startsWith("+")) return digits;
-  if (/^[6-9]\d{9}$/.test(digits)) return `+91${digits}`;
-  return digits;
-}
-
-function createOtp() {
-  return String(crypto.randomInt(100000, 1000000));
-}
-
-function saveOtp(destination, channel) {
-  const otp = createOtp();
-  otpStore.set(`${channel}:${destination}`, {
-    otp,
-    expiresAt: Date.now() + OTP_TTL_MS,
-    attempts: 0
-  });
-  return otp;
-}
-
-function consumeOtp(destination, channel, otp) {
-  const key = `${channel}:${destination}`;
-  const item = otpStore.get(key);
-  if (!item) return { ok: false, error: "OTP not found. Please request a new OTP." };
-  if (Date.now() > item.expiresAt) {
-    otpStore.delete(key);
-    return { ok: false, error: "OTP expired. Please request a new OTP." };
-  }
-  item.attempts += 1;
-  if (item.attempts > 5) {
-    otpStore.delete(key);
-    return { ok: false, error: "Too many attempts. Please request a new OTP." };
-  }
-  if (String(otp || "") !== item.otp) return { ok: false, error: "Invalid OTP." };
-  otpStore.delete(key);
-  return { ok: true };
-}
-
-async function sendEmailOtp(email, otp) {
-  if (!SMTP_USER || !SMTP_PASS) {
-    throw new Error("Gmail OTP is not configured. Add SMTP_USER and SMTP_PASS in Render.");
-  }
-  const transporter = nodemailer.createTransport({
-    host: SMTP_HOST,
-    port: SMTP_PORT,
-    secure: SMTP_PORT === 465,
-    auth: { user: SMTP_USER, pass: SMTP_PASS }
-  });
-  await transporter.sendMail({
-    from: SMTP_FROM || SMTP_USER,
-    to: email,
-    subject: "Your ERA AI verification code",
-    text: `Your ERA AI verification code is ${otp}. It expires in 10 minutes. If you did not request this code, ignore this email.`,
-    html: `<div style="font-family:Arial,sans-serif"><h2>ERA AI</h2><p>Your verification code is:</p><div style="font-size:32px;font-weight:700;letter-spacing:8px">${otp}</div><p>This code expires in 10 minutes.</p></div>`
-  });
-}
-
-async function sendSmsOtp(mobile, otp) {
-  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_FROM_NUMBER) {
-    throw new Error("SMS OTP is not configured. Add TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN and TWILIO_FROM_NUMBER in Render.");
-  }
-  const body = new URLSearchParams({
-    To: mobile,
-    From: TWILIO_FROM_NUMBER,
-    Body: `Your ERA AI verification code is ${otp}. It expires in 10 minutes.`
-  });
-  await axios.post(
-    `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(TWILIO_ACCOUNT_SID)}/Messages.json`,
-    body.toString(),
-    {
-      auth: { username: TWILIO_ACCOUNT_SID, password: TWILIO_AUTH_TOKEN },
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      timeout: 20000
-    }
-  );
-}
-
 
 if (
   VAPID_PUBLIC_KEY &&
@@ -3684,10 +3581,10 @@ async function preMarketCheck() {
 // ROOT
 // ============================================================
 
-app.get("/", (req, res) => {
-  const indexFile = path.join(__dirname, "index.html");
-  if (fs.existsSync(indexFile)) return res.sendFile(indexFile);
-  res.json({
+app.get(
+  "/",
+  (req, res) => {
+    res.json({
       ok: true,
 
       app:
@@ -4209,91 +4106,6 @@ app.get(
 );
 
 // ============================================================
-// AUTHENTICATION
-// ============================================================
-
-app.get("/api/auth/google", (req, res) => {
-  if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !GOOGLE_REDIRECT_URI) {
-    return res.status(503).json({
-      ok: false,
-      error: "Google login is not configured. Add GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET and GOOGLE_REDIRECT_URI in Render."
-    });
-  }
-  const params = new URLSearchParams({
-    client_id: GOOGLE_CLIENT_ID,
-    redirect_uri: GOOGLE_REDIRECT_URI,
-    response_type: "code",
-    scope: "openid email profile",
-    access_type: "offline",
-    prompt: "select_account"
-  });
-  res.redirect(`https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`);
-});
-
-app.get("/api/auth/google/callback", async (req, res) => {
-  try {
-    const code = String(req.query.code || "");
-    if (!code) return res.status(400).send("Google authorization code is missing.");
-    const tokenResponse = await axios.post(
-      "https://oauth2.googleapis.com/token",
-      new URLSearchParams({
-        code,
-        client_id: GOOGLE_CLIENT_ID,
-        client_secret: GOOGLE_CLIENT_SECRET,
-        redirect_uri: GOOGLE_REDIRECT_URI,
-        grant_type: "authorization_code"
-      }).toString(),
-      { headers: { "Content-Type": "application/x-www-form-urlencoded" }, timeout: 20000 }
-    );
-    const accessToken = tokenResponse.data?.access_token;
-    const userResponse = await axios.get("https://openidconnect.googleapis.com/v1/userinfo", {
-      headers: { Authorization: `Bearer ${accessToken}` }, timeout: 20000
-    });
-    const email = normalizeEmail(userResponse.data?.email);
-    if (!email) throw new Error("Google did not return an email address.");
-    const otp = saveOtp(email, "email");
-    await sendEmailOtp(email, otp);
-    const safeEmail = encodeURIComponent(email);
-    res.redirect(`/?auth=email&email=${safeEmail}&otp=sent`);
-  } catch (error) {
-    console.error("[ERA] Google auth error:", error.response?.data || error.message);
-    res.redirect(`/?auth=error&message=${encodeURIComponent(error.message || "Google login failed")}`);
-  }
-});
-
-app.post("/api/auth/send-otp", async (req, res) => {
-  try {
-    const mode = req.body?.mode === "mobile" ? "mobile" : "email";
-    const value = mode === "mobile" ? normalizeMobile(req.body?.value) : normalizeEmail(req.body?.value);
-    if (mode === "email") {
-      if (!/^[^\s@]+@gmail\.com$/i.test(value)) return res.status(400).json({ ok: false, error: "Please enter a valid Gmail address." });
-    } else if (!/^\+?[1-9]\d{7,14}$/.test(value)) {
-      return res.status(400).json({ ok: false, error: "Please enter a valid mobile number." });
-    }
-    const otp = saveOtp(value, mode);
-    if (mode === "email") await sendEmailOtp(value, otp);
-    else await sendSmsOtp(value, otp);
-    res.json({ ok: true, mode, destination: value, message: `OTP sent to ${mode === "email" ? "Gmail" : "mobile"}.` });
-  } catch (error) {
-    console.error("[ERA] Send OTP error:", error.response?.data || error.message);
-    res.status(503).json({ ok: false, error: error.message });
-  }
-});
-
-app.post("/api/auth/verify-otp", (req, res) => {
-  try {
-    const mode = req.body?.mode === "mobile" ? "mobile" : "email";
-    const value = mode === "mobile" ? normalizeMobile(req.body?.value) : normalizeEmail(req.body?.value);
-    const result = consumeOtp(value, mode, req.body?.otp);
-    if (!result.ok) return res.status(400).json(result);
-    const user = { id: crypto.randomUUID(), email: mode === "email" ? value : null, mobile: mode === "mobile" ? value : null, loginMethod: mode, verifiedAt: nowISO() };
-    res.json({ ok: true, user });
-  } catch (error) {
-    res.status(400).json({ ok: false, error: error.message });
-  }
-});
-
-// ============================================================
 // AI CHAT
 // ============================================================
 
@@ -4772,6 +4584,167 @@ app.post(
     }
   }
 );
+
+// ============================================================
+// AUTH / OTP
+// ============================================================
+
+const nodemailer = require("nodemailer");
+const crypto = require("crypto");
+
+const otpStore = new Map();
+const OTP_TTL_MS = 5 * 60 * 1000;
+const OTP_COOLDOWN_MS = 15 * 1000;
+
+const smtpTransporter =
+  process.env.SMTP_USER && process.env.SMTP_PASS
+    ? nodemailer.createTransport({
+        host: process.env.SMTP_HOST || "smtp.gmail.com",
+        port: Number(process.env.SMTP_PORT || 587),
+        secure: Number(process.env.SMTP_PORT || 587) === 465,
+        auth: {
+          user: process.env.SMTP_USER,
+          pass: process.env.SMTP_PASS
+        },
+        connectionTimeout: 10000,
+        greetingTimeout: 10000,
+        socketTimeout: 15000
+      })
+    : null;
+
+function normalizeEmail(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function normalizeMobile(value) {
+  let v = String(value || "").trim().replace(/[\\s()-]/g, "");
+  if (/^0\\d{10}$/.test(v)) v = "+91" + v.slice(1);
+  if (/^\\d{10}$/.test(v)) v = "+91" + v;
+  return v;
+}
+
+function validEmail(value) {
+  return /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(value);
+}
+
+function validMobile(value) {
+  return /^\\+[1-9]\\d{7,14}$/.test(value);
+}
+
+function makeOtp() {
+  return String(crypto.randomInt(100000, 1000000));
+}
+
+function otpHash(otp) {
+  return crypto.createHash("sha256").update(String(otp)).digest("hex");
+}
+
+async function sendEmailOtp(email, otp) {
+  if (!smtpTransporter) {
+    throw new Error("Gmail OTP is not configured on the test server.");
+  }
+  await smtpTransporter.sendMail({
+    from: `ERA AI <${process.env.SMTP_USER}>`,
+    to: email,
+    subject: "Your ERA AI verification code",
+    text: `Your ERA AI verification code is ${otp}. It expires in 5 minutes.`,
+    html: `<div style="font-family:Arial,sans-serif;padding:20px"><h2>ERA AI</h2><p>Your verification code is:</p><div style="font-size:32px;font-weight:700;letter-spacing:8px">${otp}</div><p>This code expires in 5 minutes.</p></div>`
+  });
+}
+
+async function sendSmsOtp(mobile, otp) {
+  const sid = process.env.TWILIO_ACCOUNT_SID || "";
+  const token = process.env.TWILIO_AUTH_TOKEN || "";
+  const from = process.env.TWILIO_PHONE_NUMBER || "";
+  if (!sid || !token || !from) {
+    throw new Error("Mobile OTP is not configured yet. Add the SMS provider credentials in Render.");
+  }
+  const body = new URLSearchParams({
+    To: mobile,
+    From: from,
+    Body: `ERA AI verification code: ${otp}. It expires in 5 minutes.`
+  });
+  await axios.post(
+    `https://api.twilio.com/2010-04-01/Accounts/${sid}/Messages.json`,
+    body.toString(),
+    {
+      auth: { username: sid, password: token },
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      timeout: 15000
+    }
+  );
+}
+
+app.post("/api/auth/send-otp", async (req, res) => {
+  try {
+    const mode = req.body?.mode === "mobile" ? "mobile" : "email";
+    const raw = String(req.body?.value || "").trim();
+    const destination = mode === "email" ? normalizeEmail(raw) : normalizeMobile(raw);
+
+    if (mode === "email" && !validEmail(destination)) {
+      return res.status(400).json({ ok: false, error: "Enter a valid Gmail/email address." });
+    }
+    if (mode === "mobile" && !validMobile(destination)) {
+      return res.status(400).json({ ok: false, error: "Enter a valid mobile number with country code, e.g. +919876543210." });
+    }
+
+    const existing = otpStore.get(`${mode}:${destination}`);
+    if (existing && Date.now() - existing.sentAt < OTP_COOLDOWN_MS) {
+      const wait = Math.ceil((OTP_COOLDOWN_MS - (Date.now() - existing.sentAt)) / 1000);
+      return res.status(429).json({ ok: false, error: `Please wait ${wait}s before requesting another OTP.` });
+    }
+
+    const otp = makeOtp();
+    const key = `${mode}:${destination}`;
+    const record = { hash: otpHash(otp), expiresAt: Date.now() + OTP_TTL_MS, sentAt: Date.now(), attempts: 0 };
+    otpStore.set(key, record);
+
+    try {
+      if (mode === "email") await sendEmailOtp(destination, otp);
+      else await sendSmsOtp(destination, otp);
+    } catch (sendError) {
+      otpStore.delete(key);
+      throw sendError;
+    }
+
+    return res.json({
+      ok: true,
+      destination,
+      expiresInSeconds: OTP_TTL_MS / 1000,
+      message: mode === "email" ? "OTP sent to your email." : "OTP sent to your mobile."
+    });
+  } catch (error) {
+    console.error("[ERA] OTP send error:", error.message);
+    return res.status(500).json({ ok: false, error: error.message || "Could not send OTP." });
+  }
+});
+
+app.post("/api/auth/verify-otp", (req, res) => {
+  const mode = req.body?.mode === "mobile" ? "mobile" : "email";
+  const destination = mode === "email"
+    ? normalizeEmail(req.body?.value)
+    : normalizeMobile(req.body?.value);
+  const otp = String(req.body?.otp || "").trim();
+  const key = `${mode}:${destination}`;
+  const record = otpStore.get(key);
+
+  if (!record) return res.status(400).json({ ok: false, error: "OTP expired or not requested. Send a new OTP." });
+  if (Date.now() > record.expiresAt) {
+    otpStore.delete(key);
+    return res.status(400).json({ ok: false, error: "OTP expired. Send a new OTP." });
+  }
+  if (!/^\\d{6}$/.test(otp) || !crypto.timingSafeEqual(Buffer.from(record.hash), Buffer.from(otpHash(otp)))) {
+    record.attempts += 1;
+    if (record.attempts >= 5) otpStore.delete(key);
+    return res.status(400).json({ ok: false, error: "Invalid OTP." });
+  }
+
+  otpStore.delete(key);
+  const user = mode === "email"
+    ? { type: "email", email: destination }
+    : { type: "mobile", mobile: destination };
+  return res.json({ ok: true, user, message: "Login successful." });
+});
 
 // ============================================================
 // ENGINE GET
