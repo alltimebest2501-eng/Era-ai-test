@@ -6,6 +6,8 @@ const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
 const webpush = require("web-push");
+const nodemailer = require("nodemailer");
+const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 
@@ -47,6 +49,20 @@ const VAPID_PRIVATE_KEY =
 const VAPID_SUBJECT =
   process.env.VAPID_SUBJECT ||
   "mailto:admin@era-ai.app";
+
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || "";
+const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || "";
+const SMTP_HOST = process.env.SMTP_HOST || "";
+const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
+const SMTP_USER = process.env.SMTP_USER || "";
+const SMTP_PASS = process.env.SMTP_PASS || "";
+const SMTP_FROM = process.env.SMTP_FROM || SMTP_USER || "ERA AI";
+const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
+const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
+const TWILIO_FROM = process.env.TWILIO_FROM || "";
+const ADMIN_EMAIL = process.env.ADMIN_EMAIL || "";
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "";
 
 if (
   VAPID_PUBLIC_KEY &&
@@ -137,6 +153,10 @@ const state = {
 
   notificationHistory: {},
 
+  authUsers: {},
+  authChallenges: {},
+  authSessions: {},
+
   settings: {
     movementThreshold: 20,
     minConfidence: 60,
@@ -217,6 +237,8 @@ function loadState() {
       };
     }
 
+    if (saved.authUsers && typeof saved.authUsers === "object") state.authUsers = saved.authUsers;
+    if (saved.authSessions && typeof saved.authSessions === "object") state.authSessions = saved.authSessions;
     if (saved.notificationHistory && typeof saved.notificationHistory === "object") {
       state.notificationHistory = saved.notificationHistory;
     }
@@ -248,7 +270,9 @@ function saveState() {
             state.settings,
 
           notificationHistory:
-            state.notificationHistory
+            state.notificationHistory,
+          authUsers: state.authUsers,
+          authSessions: state.authSessions
         },
         null,
         2
@@ -3503,6 +3527,61 @@ async function fetchNews() {
 }
 
 // ============================================================
+// AFTER-MARKET TOMORROW PLAN
+// ============================================================
+
+let lastAfterMarketDate = null;
+
+function buildTomorrowPlan() {
+  const indexes = Object.entries(state.analysis).map(([index, a]) => {
+    const trade = Array.isArray(a?.trades) ? a.trades[0] : null;
+    return {
+      index,
+      direction: a?.movement?.direction || "NONE",
+      structure: a?.technical?.structure?.label || a?.structure?.label || "RANGE",
+      confidence: a?.confidence ?? null,
+      suggestion: a?.suggestion || "WAIT",
+      option: trade ? `${trade.optionType} ${trade.strike}` : null,
+      entry: trade?.entry ?? null,
+      stopLoss: trade?.stopLoss ?? null,
+      target: trade?.targets?.[0] ?? null
+    };
+  });
+  return {
+    createdAt: nowISO(),
+    title: "Tomorrow Trade Plan",
+    summary: "Next-session scenarios based on the latest available ERA market and options analysis.",
+    indexes
+  };
+}
+
+async function afterMarketCheck() {
+  const { weekday, hour, minute } = getIndiaTimeParts();
+  if (!["Mon","Tue","Wed","Thu","Fri"].includes(weekday)) return;
+  const total = hour * 60 + minute;
+  if (total < 930 || total > 960) return;
+  const dateKey = new Date().toLocaleDateString("en-CA", { timeZone:"Asia/Kolkata" });
+  if (lastAfterMarketDate === dateKey) return;
+  lastAfterMarketDate = dateKey;
+  try {
+    await refreshMarketData();
+    for (const index of Object.keys(INDICES)) {
+      try { state.analysis[index] = await analyzeIndex(index); } catch (_) {}
+    }
+    const plan = buildTomorrowPlan();
+    state.history.unshift({ type:"tomorrow_plan", ...plan });
+    state.history = state.history.slice(0, 500);
+    saveState();
+    if (state.settings.notifications?.marketClose) {
+      const lines = plan.indexes.slice(0,4).map(x => `${x.index}: ${x.suggestion}${x.option ? ` • ${x.option}` : ""}`);
+      await sendPush({ title:"ERA AI — Market Closed", body:`Tomorrow plan ready. ${lines.join(" | ")}`, data:{ type:"TOMORROW_PLAN", plan } });
+    }
+  } catch (error) {
+    console.error("[ERA] After-market plan:", error.message);
+  }
+}
+
+// ============================================================
 // PRE-MARKET WATCHLIST
 // ============================================================
 
@@ -3578,35 +3657,202 @@ async function preMarketCheck() {
 }
 
 // ============================================================
+// AUTHENTICATION
+// ============================================================
+
+function randomCode() {
+  return String(Math.floor(100000 + Math.random() * 900000));
+}
+
+function randomToken() {
+  return crypto.randomBytes(32).toString("hex");
+}
+
+function emailConfigured() {
+  return Boolean(SMTP_HOST && SMTP_USER && SMTP_PASS);
+}
+
+function twilioConfigured() {
+  return Boolean(TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN && TWILIO_FROM);
+}
+
+const mailer = emailConfigured()
+  ? nodemailer.createTransport({
+      host: SMTP_HOST,
+      port: SMTP_PORT,
+      secure: SMTP_PORT === 465,
+      auth: { user: SMTP_USER, pass: SMTP_PASS }
+    })
+  : null;
+
+async function sendEmailOtp(email, code) {
+  if (!mailer) throw new Error("Email OTP is not configured. Add SMTP_HOST, SMTP_USER and SMTP_PASS in Render environment variables.");
+  await mailer.sendMail({
+    from: SMTP_FROM,
+    to: email,
+    subject: "Your ERA AI verification code",
+    text: `Your ERA AI verification code is ${code}. It expires in 10 minutes. If you did not request it, ignore this email.`,
+    html: `<div style="font-family:Arial,sans-serif"><h2>ERA AI</h2><p>Your verification code is:</p><div style="font-size:30px;font-weight:700;letter-spacing:6px">${code}</div><p>This code expires in 10 minutes.</p></div>`
+  });
+}
+
+async function sendSmsOtp(phone, code) {
+  if (!twilioConfigured()) throw new Error("SMS OTP is not configured. Add Twilio credentials in Render environment variables.");
+  const body = new URLSearchParams({
+    To: phone,
+    From: TWILIO_FROM,
+    Body: `ERA AI verification code: ${code}. Expires in 10 minutes.`
+  });
+  await axios.post(
+    `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Messages.json`,
+    body.toString(),
+    {
+      auth: { username: TWILIO_ACCOUNT_SID, password: TWILIO_AUTH_TOKEN },
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      timeout: 15000
+    }
+  );
+}
+
+function upsertAuthUser(identity, provider) {
+  const id = String(identity).toLowerCase();
+  if (!state.authUsers[id]) {
+    state.authUsers[id] = {
+      id,
+      identity,
+      provider,
+      createdAt: nowISO(),
+      lastLoginAt: null
+    };
+  }
+  state.authUsers[id].lastLoginAt = nowISO();
+  state.authUsers[id].provider = provider;
+  saveState();
+  return state.authUsers[id];
+}
+
+function createSession(user) {
+  const token = randomToken();
+  state.authSessions[token] = {
+    userId: user.id,
+    identity: user.identity,
+    role: user.role || "user",
+    createdAt: Date.now()
+  };
+  saveState();
+  return token;
+}
+
+function authUser(req) {
+  const header = String(req.headers.authorization || "");
+  const token = header.startsWith("Bearer ") ? header.slice(7) : String(req.body?.token || req.query?.token || "");
+  return token && state.authSessions[token] ? state.authSessions[token] : null;
+}
+
+app.get("/auth/google/start", (req, res) => {
+  if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !GOOGLE_REDIRECT_URI) {
+    return res.status(503).send("Google login is not configured. Add GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET and GOOGLE_REDIRECT_URI in Render.");
+  }
+  const params = new URLSearchParams({
+    client_id: GOOGLE_CLIENT_ID,
+    redirect_uri: GOOGLE_REDIRECT_URI,
+    response_type: "code",
+    scope: "openid email profile",
+    access_type: "offline",
+    prompt: "select_account"
+  });
+  res.redirect(`https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`);
+});
+
+app.get("/auth/google/callback", async (req, res) => {
+  try {
+    const code = String(req.query.code || "");
+    if (!code) return res.status(400).send("Google authorization code is missing.");
+    const tokenResponse = await axios.post(
+      "https://oauth2.googleapis.com/token",
+      new URLSearchParams({
+        code,
+        client_id: GOOGLE_CLIENT_ID,
+        client_secret: GOOGLE_CLIENT_SECRET,
+        redirect_uri: GOOGLE_REDIRECT_URI,
+        grant_type: "authorization_code"
+      }).toString(),
+      { headers: { "Content-Type": "application/x-www-form-urlencoded" }, timeout: 15000 }
+    );
+    const accessToken = tokenResponse.data?.access_token;
+    const profile = await axios.get("https://openidconnect.googleapis.com/v1/userinfo", {
+      headers: { Authorization: `Bearer ${accessToken}` }, timeout: 15000
+    });
+    const email = String(profile.data?.email || "").trim();
+    if (!email) return res.status(400).send("Google did not return an email address.");
+    const challenge = randomToken();
+    const otp = randomCode();
+    state.authChallenges[challenge] = { type: "email", identity: email, code: otp, expiresAt: Date.now() + 10 * 60 * 1000, attempts: 0 };
+    await sendEmailOtp(email, otp);
+    saveState();
+    const target = `/?auth=otp&challenge=${encodeURIComponent(challenge)}&email=${encodeURIComponent(email)}`;
+    res.redirect(target);
+  } catch (error) {
+    console.error("[ERA] Google auth error:", error.response?.data || error.message);
+    res.status(500).send("Google login could not be completed. Check Google OAuth and SMTP settings.");
+  }
+});
+
+app.post("/auth/request-otp", async (req, res) => {
+  try {
+    const type = req.body?.type === "mobile" ? "mobile" : "email";
+    const identity = String(req.body?.identity || "").trim();
+    if (type === "email" && !/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(identity)) return res.status(400).json({ ok:false, error:"Enter a valid Gmail/email address." });
+    if (type === "mobile" && !/^\\+?[1-9]\\d{9,14}$/.test(identity.replace(/\\s+/g,""))) return res.status(400).json({ ok:false, error:"Enter a valid mobile number with country code, e.g. +919876543210." });
+    const challenge = randomToken();
+    const otp = randomCode();
+    state.authChallenges[challenge] = { type, identity, code: otp, expiresAt: Date.now() + 10 * 60 * 1000, attempts: 0 };
+    if (type === "email") await sendEmailOtp(identity, otp); else await sendSmsOtp(identity.replace(/\\s+/g,""), otp);
+    saveState();
+    res.json({ ok:true, challenge, masked: type === "email" ? identity.replace(/(^.).*(@.*$)/, "$1••••$2") : identity.replace(/(\\+?\\d{2})\\d+(\\d{3})$/, "$1••••••$2") });
+  } catch (error) {
+    res.status(503).json({ ok:false, error:error.message });
+  }
+});
+
+app.post("/auth/verify-otp", (req, res) => {
+  const challenge = String(req.body?.challenge || "");
+  const code = String(req.body?.code || "").trim();
+  const item = state.authChallenges[challenge];
+  if (!item) return res.status(400).json({ ok:false, error:"Verification session expired or invalid." });
+  if (Date.now() > item.expiresAt) { delete state.authChallenges[challenge]; saveState(); return res.status(400).json({ ok:false, error:"OTP expired. Request a new code." }); }
+  item.attempts += 1;
+  if (item.attempts > 6) { delete state.authChallenges[challenge]; saveState(); return res.status(429).json({ ok:false, error:"Too many attempts. Request a new OTP." }); }
+  if (code !== item.code) return res.status(401).json({ ok:false, error:"Incorrect OTP." });
+  const user = upsertAuthUser(item.identity, item.type);
+  delete state.authChallenges[challenge];
+  const token = createSession(user);
+  res.json({ ok:true, token, user:{ id:user.id, identity:user.identity, provider:user.provider, role:"user" } });
+});
+
+app.post("/auth/admin/login", (req, res) => {
+  const email = String(req.body?.email || "").trim().toLowerCase();
+  const password = String(req.body?.password || "");
+  if (!ADMIN_EMAIL || !ADMIN_PASSWORD) return res.status(503).json({ ok:false, error:"Admin credentials are not configured in Render." });
+  if (email !== ADMIN_EMAIL.toLowerCase() || password !== ADMIN_PASSWORD) return res.status(401).json({ ok:false, error:"Invalid admin credentials." });
+  const user = { id:`admin:${email}`, identity:email, role:"admin" };
+  const token = createSession(user);
+  res.json({ ok:true, token, user });
+});
+
+app.get("/api/me", (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ ok:false, error:"Not authenticated" });
+  res.json({ ok:true, user });
+});
+
+// ============================================================
 // ROOT
 // ============================================================
 
-app.get(
-  "/",
-  (req, res) => {
-    res.json({
-      ok: true,
-
-      app:
-        "Era AI",
-
-      version:
-        VERSION,
-
-      status:
-        "running",
-
-      marketOpen:
-        isMarketHours(),
-
-      backend:
-        BACKEND_URL,
-
-      updatedAt:
-        nowISO()
-    });
-  }
-);
+app.get("/", (req, res) => {
+  res.sendFile(path.join(__dirname, "index.html"));
+});
 
 // ============================================================
 // HEALTH
@@ -4148,6 +4394,7 @@ Reply naturally and conversationally. Use simple Roman Hindi / Hinglish unless t
 
 Important style rules:
 - Answer the user's actual question first. Do not dump the full market report unless the user asks for a detailed market overview.
+- If the user asks about tomorrow, the next session, expected movement, or "kal market", use the supplied live/latest market, technical and options data to explain bullish, bearish and range scenarios, important levels and what confirmation would be needed. Do not present any scenario as certain.
 - Never return JSON, JavaScript, XML, or code blocks unless the user explicitly asks for code or structured data.
 - Do not use a giant markdown report for a simple question. Keep normal answers concise and easy to read.
 - If the user asks for a trade/setup, clearly state option type (CE/PE), strike, entry, stop loss, targets, confidence and status when those values are available.
@@ -4158,13 +4405,11 @@ Important style rules:
 
 Use the supplied market and analysis data as the source of truth.`;
 
+      const user = authUser(req);
       const userContext = {
-        market:
-          state.market,
-
-        analysis:
-          state.analysis,
-
+        market: state.market,
+        analysis: state.analysis,
+        recentConversation: Array.isArray(req.body?.history) ? req.body.history.slice(-12) : [],
         message
       };
 
@@ -4232,6 +4477,7 @@ Use the supplied market and analysis data as the source of truth.`;
         userMessage: message,
         answer,
         index: req.body?.index || null,
+        userId: user?.userId || null,
         createdAt: nowISO()
       });
 
@@ -4392,7 +4638,7 @@ app.get(
       ok: true,
 
       history:
-        state.history
+        state.history.filter(x => !x.userId || x.userId === authUser(req)?.userId)
     });
   }
 );
@@ -4408,8 +4654,10 @@ app.post(
       const trade =
         req.body || {};
 
+      const user = authUser(req);
       const record = {
         ...trade,
+        userId: user?.userId || trade.userId || null,
 
         id:
           trade.id ||
@@ -4480,6 +4728,7 @@ app.post(
       const subscription =
         req.body?.subscription ||
         req.body;
+      const user = authUser(req);
 
       if (
         !subscription ||
@@ -4504,7 +4753,7 @@ app.post(
 
       if (!exists) {
         state.pushSubscriptions
-          .push(subscription);
+          .push({ ...subscription, userId: user?.userId || null });
 
         saveState();
       }
@@ -4692,6 +4941,14 @@ setInterval(
   state.settings
     .newsIntervalMs
 );
+
+// ============================================================
+// AFTER-MARKET CHECK
+// ============================================================
+
+setInterval(async () => {
+  try { await afterMarketCheck(); } catch (error) { console.error("[ERA] After-market:", error.message); }
+}, 5 * 60 * 1000);
 
 // ============================================================
 // PRE-MARKET CHECK
