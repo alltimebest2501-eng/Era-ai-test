@@ -62,7 +62,7 @@
 <div class="toast-container" id="toastContainer"></div>
 <script>
 'use strict';
-const BACKEND='https://era-ai.onrender.com';
+const BACKEND=window.location.origin;
 const S={index:localStorage.getItem('eraSelectedIndex')||'NIFTY',market:{},analysis:{},activeTrades:[],settings:{},optionIndex:'NIFTY',history:[],historyFilter:'all'};
 const $=id=>document.getElementById(id);
 const esc=v=>String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]));
