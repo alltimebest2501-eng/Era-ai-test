@@ -13,7 +13,7 @@ const path = require("path");
 const app = express();
 
 const PORT = process.env.PORT || 10000;
-const VERSION = "8.1.3";
+const VERSION = "8.1.4";
 
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
@@ -21,119 +21,13 @@ app.use(express.json({ limit: "2mb" }));
 // Serve the ERA test UI from the same Render service.
 app.use(express.static(path.join(__dirname, "public")));
 
-// Test UI is served from the repository root.
+// TEST AUTH: also serve root index.html when no public/ copy exists.
 app.get("/", (req, res) => {
-  res.sendFile(path.join(__dirname, "index.html"));
-});
-
-// ============================================================
-// TEST AUTH — GMAIL OTP / MOBILE OTP
-// ============================================================
-
-const pendingOtps = new Map();
-const OTP_TTL_MS = 5 * 60 * 1000;
-const OTP_RESEND_MS = 10 * 1000;
-
-function normalizeEmail(value) {
-  return String(value || "").trim().toLowerCase();
-}
-
-function validEmail(value) {
-  return /^[^\\s@]+@[^\\s@]+\\.[^\\s@]{2,}$/i.test(normalizeEmail(value));
-}
-
-function validGmail(value) {
-  const email = normalizeEmail(value);
-  return validEmail(email) && email.endsWith("@gmail.com");
-}
-
-function validMobile(value) {
-  const digits = String(value || "").replace(/\\D/g, "");
-  return digits.length >= 10 && digits.length <= 15;
-}
-
-function makeOtp() {
-  return String(Math.floor(100000 + Math.random() * 900000));
-}
-
-function smtpTransport() {
-  const user = String(process.env.SMTP_USER || "").trim();
-  const pass = String(process.env.SMTP_PASS || "").replace(/\\s/g, "");
-  if (!user || !pass) return null;
-  return nodemailer.createTransport({
-    host: process.env.SMTP_HOST || "smtp.gmail.com",
-    port: Number(process.env.SMTP_PORT || 587),
-    secure: Number(process.env.SMTP_PORT || 587) === 465,
-    auth: { user, pass }
-  });
-}
-
-app.post("/api/auth/send-otp", async (req, res) => {
-  try {
-    const mode = req.body?.mode === "mobile" ? "mobile" : "email";
-    const value = String(req.body?.value || "").trim();
-
-    if (mode === "email") {
-      if (!validGmail(value)) {
-        return res.status(400).json({ error: "Enter a valid Gmail/email address." });
-      }
-    } else if (!validMobile(value)) {
-      return res.status(400).json({ error: "Enter a valid mobile number." });
-    }
-
-    if (mode === "mobile") {
-      return res.status(501).json({ error: "Mobile OTP is not configured yet. Add an SMS provider in Render Environment first." });
-    }
-
-    const destination = normalizeEmail(value);
-    const existing = pendingOtps.get(`${mode}:${destination}`);
-    if (existing && Date.now() - existing.sentAt < OTP_RESEND_MS) {
-      const wait = Math.ceil((OTP_RESEND_MS - (Date.now() - existing.sentAt)) / 1000);
-      return res.status(429).json({ error: `Please wait ${wait}s before requesting another OTP.` });
-    }
-
-    const transporter = smtpTransport();
-    if (!transporter) {
-      return res.status(503).json({ error: "Gmail OTP is not configured. Add SMTP_USER and SMTP_PASS in Render Environment." });
-    }
-
-    const otp = makeOtp();
-    pendingOtps.set(`${mode}:${destination}`, { otp, sentAt: Date.now(), expiresAt: Date.now() + OTP_TTL_MS });
-
-    await transporter.sendMail({
-      from: process.env.SMTP_USER,
-      to: destination,
-      subject: "Your ERA AI login OTP",
-      text: `Your ERA AI login OTP is ${otp}. It expires in 5 minutes. If you did not request this, ignore this email.`,
-      html: `<div style="font-family:Arial,sans-serif;max-width:520px;margin:auto;padding:24px;background:#07111f;color:#eef7ff;border-radius:16px"><h2>ERA AI Login</h2><p>Your 6-digit verification code is:</p><div style="font-size:32px;font-weight:800;letter-spacing:8px;padding:16px 0">${otp}</div><p style="color:#8196b2">This code expires in 5 minutes.</p></div>`
-    });
-
-    return res.json({ ok: true, destination, message: `OTP sent to ${destination}.` });
-  } catch (error) {
-    console.error("[ERA AUTH] send OTP:", error.message);
-    return res.status(500).json({ error: "Could not send OTP. Check the Gmail SMTP settings in Render." });
-  }
-});
-
-app.post("/api/auth/verify-otp", (req, res) => {
-  const mode = req.body?.mode === "mobile" ? "mobile" : "email";
-  const value = String(req.body?.value || "").trim();
-  const otp = String(req.body?.otp || "").trim();
-  const destination = mode === "email" ? normalizeEmail(value) : value;
-  const key = `${mode}:${destination}`;
-  const record = pendingOtps.get(key);
-
-  if (!record || Date.now() > record.expiresAt) {
-    pendingOtps.delete(key);
-    return res.status(400).json({ error: "OTP expired. Please request a new OTP." });
-  }
-  if (record.otp !== otp) {
-    return res.status(400).json({ error: "Incorrect OTP. Please try again." });
-  }
-
-  pendingOtps.delete(key);
-  const user = mode === "email" ? { email: destination, verified: true } : { mobile: destination, verified: true };
-  return res.json({ ok: true, user });
+  const publicIndex = path.join(__dirname, "public", "index.html");
+  const rootIndex = path.join(__dirname, "index.html");
+  if (fs.existsSync(publicIndex)) return res.sendFile(publicIndex);
+  if (fs.existsSync(rootIndex)) return res.sendFile(rootIndex);
+  res.status(404).send("Era AI UI not found");
 });
 
 // ============================================================
@@ -163,6 +57,107 @@ const VAPID_PRIVATE_KEY =
 const VAPID_SUBJECT =
   process.env.VAPID_SUBJECT ||
   "mailto:admin@era-ai.app";
+
+// ============================================================
+// TEST AUTH / EMAIL OTP
+// ============================================================
+const authOtps = new Map();
+const AUTH_OTP_TTL_MS = 5 * 60 * 1000;
+const AUTH_RESEND_MS = 10 * 1000;
+
+function normalizeAuthEmail(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function isValidEmail(value) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizeAuthEmail(value));
+}
+
+function isValidMobile(value) {
+  return /^[+]?[0-9\s-]{10,16}$/.test(String(value || "").trim());
+}
+
+function maskEmail(email) {
+  const [name, domain] = email.split("@");
+  if (!name) return email;
+  return `${name.length <= 2 ? name[0] + "*" : name[0] + "***" + name.slice(-1)}@${domain}`;
+}
+
+async function sendEmailOtp(email, otp) {
+  const user = process.env.SMTP_USER;
+  const pass = process.env.SMTP_PASS;
+  if (!user || !pass) throw new Error("Gmail OTP is not configured on Render. Add SMTP_USER and SMTP_PASS.");
+
+  const transporter = nodemailer.createTransport({
+    host: process.env.SMTP_HOST || "smtp.gmail.com",
+    port: Number(process.env.SMTP_PORT || 587),
+    secure: Number(process.env.SMTP_PORT || 587) === 465,
+    auth: { user, pass },
+    connectionTimeout: 15000,
+    greetingTimeout: 15000,
+    socketTimeout: 20000
+  });
+
+  await transporter.sendMail({
+    from: `ERA AI <${user}>`,
+    to: email,
+    subject: `${otp} is your ERA AI login OTP`,
+    text: `Your ERA AI login OTP is ${otp}. It expires in 5 minutes. If you did not request this, ignore this email.`,
+    html: `<div style="font-family:Arial,sans-serif"><h2>ERA AI Login</h2><p>Your 6-digit OTP is:</p><div style="font-size:32px;font-weight:700;letter-spacing:8px">${otp}</div><p>This OTP expires in 5 minutes.</p></div>`
+  });
+}
+
+app.post("/api/auth/send-otp", async (req, res) => {
+  try {
+    const mode = req.body?.mode === "mobile" ? "mobile" : "email";
+    const value = String(req.body?.value || "").trim();
+
+    if (mode === "email" && !isValidEmail(value)) {
+      return res.status(400).json({ ok: false, error: "Enter a valid Gmail or email address." });
+    }
+    if (mode === "mobile" && !isValidMobile(value)) {
+      return res.status(400).json({ ok: false, error: "Enter a valid mobile number." });
+    }
+
+    const key = `${mode}:${mode === "email" ? normalizeAuthEmail(value) : value.replace(/\D/g, "")}`;
+    const previous = authOtps.get(key);
+    if (previous && Date.now() - previous.sentAt < AUTH_RESEND_MS) {
+      return res.status(429).json({ ok: false, error: "Please wait a few seconds before requesting another OTP." });
+    }
+
+    const otp = String(Math.floor(100000 + Math.random() * 900000));
+    authOtps.set(key, { otp, sentAt: Date.now(), expiresAt: Date.now() + AUTH_OTP_TTL_MS });
+
+    if (mode === "email") {
+      await sendEmailOtp(normalizeAuthEmail(value), otp);
+      return res.json({ ok: true, destination: normalizeAuthEmail(value), message: `OTP sent to ${maskEmail(normalizeAuthEmail(value))}.` });
+    }
+
+    authOtps.delete(key);
+    return res.status(503).json({ ok: false, error: "Mobile OTP is not configured yet. Add an SMS provider in Render Environment Variables." });
+  } catch (error) {
+    console.error("[ERA] OTP send error:", error.message);
+    return res.status(500).json({ ok: false, error: error.message || "Could not send OTP." });
+  }
+});
+
+app.post("/api/auth/verify-otp", (req, res) => {
+  const mode = req.body?.mode === "mobile" ? "mobile" : "email";
+  const value = String(req.body?.value || "").trim();
+  const otp = String(req.body?.otp || "").trim();
+  const normalized = mode === "email" ? normalizeAuthEmail(value) : value.replace(/\D/g, "");
+  const key = `${mode}:${normalized}`;
+  const record = authOtps.get(key);
+
+  if (!/^\d{6}$/.test(otp)) return res.status(400).json({ ok: false, error: "Enter the 6-digit OTP." });
+  if (!record) return res.status(400).json({ ok: false, error: "OTP not found. Please request a new OTP." });
+  if (Date.now() > record.expiresAt) { authOtps.delete(key); return res.status(400).json({ ok: false, error: "OTP expired. Please request a new OTP." }); }
+  if (record.otp !== otp) return res.status(400).json({ ok: false, error: "Incorrect OTP. Please try again." });
+
+  authOtps.delete(key);
+  const user = mode === "email" ? { email: normalized, verified: true, loginMethod: "email" } : { mobile: normalized, verified: true, loginMethod: "mobile" };
+  return res.json({ ok: true, user });
+});
 
 if (
   VAPID_PUBLIC_KEY &&
