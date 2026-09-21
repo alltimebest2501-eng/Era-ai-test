@@ -13,22 +13,22 @@ const path = require("path");
 const app = express();
 
 const PORT = process.env.PORT || 10000;
-const VERSION = "8.1.4";
+const VERSION = "8.1.5";
 
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
-// Serve the ERA test UI from the same Render service.
-app.use(express.static(path.join(__dirname, "public")));
-
-// TEST AUTH: also serve root index.html when no public/ copy exists.
+// Serve the test UI from the root index.html shipped with this package.
+// This avoids accidentally serving an older public/index.html from a previous deploy.
 app.get("/", (req, res) => {
-  const publicIndex = path.join(__dirname, "public", "index.html");
   const rootIndex = path.join(__dirname, "index.html");
-  if (fs.existsSync(publicIndex)) return res.sendFile(publicIndex);
   if (fs.existsSync(rootIndex)) return res.sendFile(rootIndex);
+  const publicIndex = path.join(__dirname, "public", "index.html");
+  if (fs.existsSync(publicIndex)) return res.sendFile(publicIndex);
   res.status(404).send("Era AI UI not found");
 });
+
+app.use(express.static(path.join(__dirname, "public")));
 
 // ============================================================
 // ENV
