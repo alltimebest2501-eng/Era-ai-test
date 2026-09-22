@@ -12,19 +12,13 @@ const path = require("path");
 const app = express();
 
 const PORT = process.env.PORT || 10000;
-const VERSION = "8.1.7";
+const VERSION = "8.1.6";
 
 app.use(cors());
-app.use(express.json({ limit: "8mb" }));
+app.use(express.json({ limit: "2mb" }));
 
 // Serve the test UI from the root index.html shipped with this package.
 // This avoids accidentally serving an older public/index.html from a previous deploy.
-app.get("/sw.js", (req, res) => {
-  const sw = path.join(__dirname, "sw.js");
-  if (fs.existsSync(sw)) return res.sendFile(sw);
-  res.status(404).send("Service worker not found");
-});
-
 app.get("/", (req, res) => {
   const rootIndex = path.join(__dirname, "index.html");
   if (fs.existsSync(rootIndex)) return res.sendFile(rootIndex);
@@ -78,6 +72,10 @@ function isValidEmail(value) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizeAuthEmail(value));
 }
 
+function isValidMobile(value) {
+  return /^[+]?[0-9\s-]{10,16}$/.test(String(value || "").trim());
+}
+
 function maskEmail(email) {
   const [name, domain] = email.split("@");
   if (!name) return email;
@@ -119,13 +117,17 @@ async function sendEmailOtp(email, otp) {
 
 app.post("/api/auth/send-otp", async (req, res) => {
   try {
+    const mode = req.body?.mode === "mobile" ? "mobile" : "email";
     const value = String(req.body?.value || "").trim();
-    if (!isValidEmail(value)) {
+
+    if (mode === "email" && !isValidEmail(value)) {
       return res.status(400).json({ ok: false, error: "Enter a valid Gmail or email address." });
     }
+    if (mode === "mobile" && !isValidMobile(value)) {
+      return res.status(400).json({ ok: false, error: "Enter a valid mobile number." });
+    }
 
-    const normalized = normalizeAuthEmail(value);
-    const key = `email:${normalized}`;
+    const key = `${mode}:${mode === "email" ? normalizeAuthEmail(value) : value.replace(/\D/g, "")}`;
     const previous = authOtps.get(key);
     if (previous && Date.now() - previous.sentAt < AUTH_RESEND_MS) {
       return res.status(429).json({ ok: false, error: "Please wait a few seconds before requesting another OTP." });
@@ -133,20 +135,26 @@ app.post("/api/auth/send-otp", async (req, res) => {
 
     const otp = String(Math.floor(100000 + Math.random() * 900000));
     authOtps.set(key, { otp, sentAt: Date.now(), expiresAt: Date.now() + AUTH_OTP_TTL_MS });
-    await sendEmailOtp(normalized, otp);
-    return res.json({ ok: true, destination: normalized, message: `OTP sent to ${maskEmail(normalized)}.` });
+
+    if (mode === "email") {
+      await sendEmailOtp(normalizeAuthEmail(value), otp);
+      return res.json({ ok: true, destination: normalizeAuthEmail(value), message: `OTP sent to ${maskEmail(normalizeAuthEmail(value))}.` });
+    }
+
+    authOtps.delete(key);
+    return res.status(503).json({ ok: false, error: "Mobile OTP is not configured yet. Add an SMS provider in Render Environment Variables." });
   } catch (error) {
-    console.error("[ERA] OTP send error:", error.response?.data || error.message);
-    return res.status(500).json({ ok: false, error: error.response?.data?.message || error.message || "Could not send OTP." });
+    console.error("[ERA] OTP send error:", error.message);
+    return res.status(500).json({ ok: false, error: error.message || "Could not send OTP." });
   }
 });
 
 app.post("/api/auth/verify-otp", (req, res) => {
-  const mode = "email";
+  const mode = req.body?.mode === "mobile" ? "mobile" : "email";
   const value = String(req.body?.value || "").trim();
   const otp = String(req.body?.otp || "").trim();
-  const normalized = normalizeAuthEmail(value);
-  const key = `email:${normalized}`;
+  const normalized = mode === "email" ? normalizeAuthEmail(value) : value.replace(/\D/g, "");
+  const key = `${mode}:${normalized}`;
   const record = authOtps.get(key);
 
   if (!/^\d{6}$/.test(otp)) return res.status(400).json({ ok: false, error: "Enter the 6-digit OTP." });
@@ -155,7 +163,7 @@ app.post("/api/auth/verify-otp", (req, res) => {
   if (record.otp !== otp) return res.status(400).json({ ok: false, error: "Incorrect OTP. Please try again." });
 
   authOtps.delete(key);
-  const user = { email: normalized, verified: true, loginMethod: "email" };
+  const user = mode === "email" ? { email: normalized, verified: true, loginMethod: "email" } : { mobile: normalized, verified: true, loginMethod: "mobile" };
   return res.json({ ok: true, user });
 });
 
@@ -437,6 +445,32 @@ function normalizeIndex(index) {
     .trim()
     .toUpperCase()
     .replace(/\s+/g, "");
+}
+
+// Convert API/model values to real human-readable text.
+// This prevents objects from reaching the UI as "[object Object]".
+function textFromValue(value) {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (Array.isArray(value)) {
+    return value
+      .map(item => textFromValue(item?.text ?? item?.content ?? item))
+      .filter(Boolean)
+      .join("\n");
+  }
+  if (typeof value === "object") {
+    const direct = value.text ?? value.content ?? value.answer ?? value.message ?? value.error;
+    if (direct !== undefined && direct !== value) return textFromValue(direct);
+    try { return JSON.stringify(value); } catch (_) { return "Unknown error"; }
+  }
+  return String(value);
+}
+
+function errorText(error) {
+  const data = error?.response?.data;
+  const candidate = data?.error ?? data?.message ?? data ?? error?.message;
+  return textFromValue(candidate) || "ERA could not generate a response.";
 }
 
 // ============================================================
@@ -3614,63 +3648,6 @@ async function fetchNews() {
 }
 
 // ============================================================
-// POST-MARKET NOTIFICATIONS
-// ============================================================
-
-let lastPostMarketDate = null;
-
-function indiaDateKey() {
-  return new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
-}
-
-function buildTomorrowPlan() {
-  const analyses = Object.values(state.analysis || {});
-  const usable = analyses.filter(x => x && x.available);
-  if (!usable.length) {
-    return "Tomorrow plan: live analysis is not available yet. ERA will reassess NIFTY, BANKNIFTY, FINNIFTY and SENSEX before the open.";
-  }
-  const parts = usable.slice(0,4).map(a => {
-    const move = a.movement?.direction || "NONE";
-    const suggestion = a.suggestion || "WAIT";
-    const confidence = Number.isFinite(Number(a.confidence)) ? `${a.confidence}%` : "—";
-    return `${a.index}: ${suggestion} (${move}, ${confidence})`;
-  });
-  return `Tomorrow trade plan: ${parts.join(" • ")}. Use confirmation at the open; levels can change with fresh data.`;
-}
-
-async function postMarketCheck() {
-  if (!state.settings.notifications?.marketClose) return;
-  const { weekday, hour, minute } = getIndiaTimeParts();
-  if (!["Mon","Tue","Wed","Thu","Fri"].includes(weekday)) return;
-  const total = hour * 60 + minute;
-  if (total < 931 || total >= 960) return;
-  const dateKey = indiaDateKey();
-  if (lastPostMarketDate === dateKey) return;
-  lastPostMarketDate = dateKey;
-
-  const closeKey = `market-close:${dateKey}`;
-  if (!state.notificationHistory[closeKey]) {
-    state.notificationHistory[closeKey] = Date.now();
-    await sendPush({
-      title: "Era AI — Market Closed",
-      body: "Indian market is closed. ERA is preparing tomorrow's trade plan.",
-      data: { type: "MARKET_CLOSE", date: dateKey }
-    });
-  }
-
-  const planKey = `tomorrow-plan:${dateKey}`;
-  if (!state.notificationHistory[planKey]) {
-    state.notificationHistory[planKey] = Date.now();
-    await sendPush({
-      title: "Era AI — Tomorrow Trade Plan",
-      body: buildTomorrowPlan(),
-      data: { type: "TOMORROW_PLAN", date: dateKey, plan: buildTomorrowPlan() }
-    });
-  }
-  saveState();
-}
-
-// ============================================================
 // PRE-MARKET WATCHLIST
 // ============================================================
 
@@ -4293,21 +4270,11 @@ app.post(
           });
       }
 
-      const imageData =
-        typeof req.body?.image === "string"
-          ? req.body.image.trim()
-          : "";
-
-      let message =
+      const message =
         String(
           req.body?.message ||
           ""
         ).trim();
-
-      if (!message && imageData) {
-        message =
-          "Is screenshot/image ko carefully analyze karke batao ki isme kya dikh raha hai, market ya trade ke liye iska kya meaning hai, aur agar data insufficient ho to clearly bolo.";
-      }
 
       if (!message) {
         return res.status(400)
@@ -4315,23 +4282,8 @@ app.post(
             ok: false,
 
             error:
-              "Message or image is required"
+              "Message is required"
           });
-      }
-
-      if (imageData &&
-          !/^data:image\/(png|jpe?g|webp);base64,/i.test(imageData)) {
-        return res.status(400).json({
-          ok: false,
-          error: "Only PNG, JPG/JPEG or WEBP images are supported."
-        });
-      }
-
-      if (imageData.length > 7_000_000) {
-        return res.status(413).json({
-          ok: false,
-          error: "Image is too large. Please upload a smaller screenshot."
-        });
       }
 
       const systemPrompt = `
@@ -4349,15 +4301,7 @@ Important style rules:
 - If live data is missing or insufficient, say so clearly and prefer WAIT / DATA UNAVAILABLE.
 - Do not claim certainty or guaranteed profit.
 
-Use the supplied market and analysis data as the source of truth.
-
-If an image is attached, inspect the image itself carefully. Read visible
-prices, strikes, labels, charts and UI values only when they are actually
-visible. Separate what is visible from what you infer. Never invent a
-number that cannot be read. Explain the screenshot in normal conversational
-language and connect it to the user's question.
-
-Do not return an object/array as the answer. Return plain human-readable text.`;
+Use the supplied market and analysis data as the source of truth.`;
 
       const userContext = {
         market:
@@ -4368,20 +4312,6 @@ Do not return an object/array as the answer. Return plain human-readable text.`;
 
         message
       };
-
-      const userContent = [
-        {
-          type: "text",
-          text: JSON.stringify(userContext)
-        }
-      ];
-
-      if (imageData) {
-        userContent.push({
-          type: "image_url",
-          image_url: { url: imageData }
-        });
-      }
 
       const response =
         await axios.post(
@@ -4405,9 +4335,9 @@ Do not return an object/array as the answer. Return plain human-readable text.`;
                   "user",
 
                 content:
-                  imageData
-                    ? userContent
-                    : userContent[0].text
+                  JSON.stringify(
+                    userContext
+                  )
               }
             ],
 
@@ -4441,43 +4371,14 @@ Do not return an object/array as the answer. Return plain human-readable text.`;
           ?.message
           ?.content;
 
-      function normalizeAIContent(value) {
-        if (typeof value === "string") return value;
-        if (Array.isArray(value)) {
-          return value
-            .map(part => {
-              if (typeof part === "string") return part;
-              if (part && typeof part.text === "string") return part.text;
-              if (part && typeof part.content === "string") return part.content;
-              return "";
-            })
-            .filter(Boolean)
-            .join("\n")
-            .trim();
-        }
-        if (value && typeof value === "object") {
-          if (typeof value.text === "string") return value.text;
-          if (typeof value.content === "string") return value.content;
-          if (typeof value.answer === "string") return value.answer;
-          if (typeof value.message === "string") return value.message;
-          try {
-            return JSON.stringify(value);
-          } catch (_) {
-            return "";
-          }
-        }
-        return "";
-      }
-
       const answer =
-        normalizeAIContent(rawAnswer) ||
-        "ERA could not generate a readable response right now.";
+        textFromValue(rawAnswer) ||
+        "No response.";
 
       state.history.unshift({
         type: "chat",
         userMessage: message,
         answer,
-        hasImage: Boolean(imageData),
         index: req.body?.index || null,
         createdAt: nowISO()
       });
@@ -4500,12 +4401,9 @@ Do not return an object/array as the answer. Return plain human-readable text.`;
         error.message
       );
 
-      res.status(500).json({
+      res.status(Number(error?.response?.status) || 500).json({
         ok: false,
-
-        error:
-          error.response?.data ||
-          error.message
+        error: errorText(error)
       });
     }
   }
@@ -4959,17 +4857,6 @@ setInterval(
   5 * 60 * 1000
 );
 
-setInterval(
-  async () => {
-    try {
-      await postMarketCheck();
-    } catch (error) {
-      console.error("[ERA] Post-market notification:", error.message);
-    }
-  },
-  60 * 1000
-);
-
 // ============================================================
 // INITIALIZATION
 // ============================================================
@@ -4989,7 +4876,6 @@ setInterval(
     );
 
     await fetchNews();
-    try { await postMarketCheck(); } catch (_) {}
 
   } catch (error) {
     console.error(
