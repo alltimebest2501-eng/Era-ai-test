@@ -12,7 +12,7 @@ const path = require("path");
 const app = express();
 
 const PORT = process.env.PORT || 10000;
-const VERSION = "8.1.7";
+const VERSION = "8.1.6";
 
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
@@ -267,8 +267,7 @@ const state = {
       movement: true,
       tradeSetup: true,
       news: true,
-      marketClose: true,
-      tomorrowPlan: true
+      marketClose: true
     }
   }
 };
@@ -446,32 +445,6 @@ function normalizeIndex(index) {
     .trim()
     .toUpperCase()
     .replace(/\s+/g, "");
-}
-
-// Convert API/model values to real human-readable text.
-// This prevents objects from reaching the UI as "[object Object]".
-function textFromValue(value) {
-  if (value === null || value === undefined) return "";
-  if (typeof value === "string") return value;
-  if (typeof value === "number" || typeof value === "boolean") return String(value);
-  if (Array.isArray(value)) {
-    return value
-      .map(item => textFromValue(item?.text ?? item?.content ?? item))
-      .filter(Boolean)
-      .join("\n");
-  }
-  if (typeof value === "object") {
-    const direct = value.text ?? value.content ?? value.answer ?? value.message ?? value.error;
-    if (direct !== undefined && direct !== value) return textFromValue(direct);
-    try { return JSON.stringify(value); } catch (_) { return "Unknown error"; }
-  }
-  return String(value);
-}
-
-function errorText(error) {
-  const data = error?.response?.data;
-  const candidate = data?.error ?? data?.message ?? data ?? error?.message;
-  return textFromValue(candidate) || "ERA could not generate a response.";
 }
 
 // ============================================================
@@ -3426,132 +3399,6 @@ async function notifyMarketMove(
 }
 
 // ============================================================
-// MARKET SESSION NOTIFICATIONS
-// ============================================================
-
-function indiaDateKey() {
-  return new Date().toLocaleDateString("en-CA", {
-    timeZone: "Asia/Kolkata"
-  });
-}
-
-function previousTradingDateKey() {
-  const d = new Date();
-  d.setUTCDate(d.getUTCDate() - 1);
-  return d.toLocaleDateString("en-CA", {
-    timeZone: "Asia/Kolkata"
-  });
-}
-
-function tomorrowLabel() {
-  const d = new Date();
-  d.setUTCDate(d.getUTCDate() + 1);
-  return d.toLocaleDateString("en-IN", {
-    timeZone: "Asia/Kolkata",
-    weekday: "short",
-    day: "2-digit",
-    month: "short"
-  });
-}
-
-function buildTomorrowPlan() {
-  const names = {
-    NIFTY: "NIFTY",
-    BANKNIFTY: "BANK NIFTY",
-    FINNIFTY: "FIN NIFTY",
-    SENSEX: "SENSEX"
-  };
-
-  const parts = [];
-  for (const index of Object.keys(names)) {
-    const a = state.analysis[index];
-    const m = state.market[index];
-    if (!a) continue;
-
-    const direction = a.movement?.direction || "SIDEWAYS";
-    const confidence = Number(a.confidence || 0);
-    const trade = Array.isArray(a.trades) ? a.trades[0] : null;
-    const price = Number(m?.price);
-
-    let line = `${names[index]}: ${direction}`;
-    if (Number.isFinite(price) && price > 0) line += ` near ${round(price)}`;
-    if (trade) {
-      line += ` | ${trade.optionType} ${trade.strike} setup`;
-    } else {
-      line += ` | WAIT for confirmation`;
-    }
-    line += ` | ${confidence}% confidence`;
-    parts.push(line);
-  }
-
-  if (!parts.length) {
-    return `Tomorrow (${tomorrowLabel()}): Live analysis was not available at market close. WAIT for fresh confirmation after 09:15 IST.`;
-  }
-
-  return `Tomorrow (${tomorrowLabel()}): ${parts.join(" • ")}`;
-}
-
-async function notifyMarketOpenOnce() {
-  if (!state.settings.notifications?.marketOpen) return;
-  const dateKey = indiaDateKey();
-  const key = `market-open:${dateKey}`;
-  if (state.notificationHistory[key]) return;
-
-  state.notificationHistory[key] = Date.now();
-  saveState();
-  await sendPush({
-    title: "Era AI — Market Open",
-    body: "Market is live. ERA is monitoring NIFTY, BANK NIFTY, FIN NIFTY and SENSEX.",
-    data: { type: "MARKET_OPEN", date: dateKey }
-  });
-}
-
-async function notifyMarketCloseOnce() {
-  if (!state.settings.notifications?.marketClose) return;
-  const dateKey = indiaDateKey();
-  const key = `market-close:${dateKey}`;
-  if (state.notificationHistory[key]) return;
-
-  state.notificationHistory[key] = Date.now();
-  saveState();
-  await sendPush({
-    title: "Era AI — Market Closed",
-    body: "Market is closed. ERA has prepared the next-day trade plan.",
-    data: { type: "MARKET_CLOSE", date: dateKey }
-  });
-}
-
-async function notifyTomorrowPlanOnce() {
-  if (!state.settings.notifications?.tomorrowPlan) return;
-  const dateKey = indiaDateKey();
-  const key = `tomorrow-plan:${dateKey}`;
-  if (state.notificationHistory[key]) return;
-
-  const plan = buildTomorrowPlan();
-  state.notificationHistory[key] = Date.now();
-  saveState();
-  await sendPush({
-    title: "Era AI — Tomorrow Trade Plan",
-    body: plan,
-    data: {
-      type: "TOMORROW_TRADE_PLAN",
-      date: dateKey,
-      plan
-    }
-  });
-}
-
-async function handleClosedSessionNotifications() {
-  const { weekday, hour, minute } = getIndiaTimeParts();
-  if (!["Mon", "Tue", "Wed", "Thu", "Fri"].includes(weekday)) return;
-  const total = hour * 60 + minute;
-  if (total < 931) return;
-
-  await notifyMarketCloseOnce();
-  await notifyTomorrowPlanOnce();
-}
-
-// ============================================================
 // MONITOR MARKET
 // ============================================================
 
@@ -3569,13 +3416,14 @@ async function monitorMarketState() {
   try {
     await refreshMarketData();
 
-    if (!isMarketHours()) {
-      state.lastScan = nowISO();
-      await handleClosedSessionNotifications();
+    if (
+      !isMarketHours()
+    ) {
+      state.lastScan =
+        nowISO();
+
       return;
     }
-
-    await notifyMarketOpenOnce();
 
     const indices =
       Object.keys(
@@ -4429,15 +4277,46 @@ Important style rules:
 
 Use the supplied market and analysis data as the source of truth.`;
 
-      const userContext = {
-        market:
-          state.market,
-
-        analysis:
-          state.analysis,
-
+      // Keep the OpenRouter prompt small. The full state.analysis object can contain
+      // large option/technical arrays; sending it repeatedly caused 44k+ token failures.
+      const requestedIndex = String(req.body?.index || "NIFTY").toUpperCase();
+      const index = INDICES[requestedIndex] ? requestedIndex : "NIFTY";
+      const m = state.market?.[index] || {};
+      const a = state.analysis?.[index] || {};
+      const t = a.technical || {};
+      const o = a.options || {};
+      const compactTrades = Array.isArray(a.trades) ? a.trades.slice(0, 3).map(x => ({
+        optionType: x.optionType, strike: x.strike, entry: x.entry,
+        stopLoss: x.stopLoss, targets: Array.isArray(x.targets) ? x.targets.slice(0, 3) : [],
+        confidence: x.confidence, status: x.status
+      })) : [];
+      const compactContext = {
+        index,
+        market: {
+          name: m.name, price: m.price, previousClose: m.previousClose,
+          change: m.change, changePercent: m.changePercent, open: m.open,
+          high: m.high, low: m.low, volume: m.volume, timestamp: m.timestamp,
+          source: m.source, stale: m.stale
+        },
+        analysis: {
+          direction: a.direction, movement: a.movement, confidence: a.confidence,
+          suggestion: a.suggestion, reasons: Array.isArray(a.reasons) ? a.reasons.slice(0, 5) : [],
+          risks: Array.isArray(a.risks) ? a.risks.slice(0, 5) : [],
+          technical: {
+            emaTrend: t.emaTrend, rsi: t.rsi, vwap: t.vwap,
+            structure: t.structure?.label || t.structure,
+            bos: t.bos, choch: t.choch
+          },
+          options: {
+            pcr: o.pcr, sentiment: o.sentiment,
+            callOI: o.callOI, putOI: o.putOI
+          },
+          trades: compactTrades
+        },
         message
       };
+
+      const userContext = compactContext;
 
       const response =
         await axios.post(
@@ -4494,14 +4373,11 @@ Use the supplied market and analysis data as the source of truth.`;
           }
         );
 
-      const rawAnswer =
+      const answer =
         response.data
           ?.choices?.[0]
           ?.message
-          ?.content;
-
-      const answer =
-        textFromValue(rawAnswer) ||
+          ?.content ||
         "No response.";
 
       state.history.unshift({
@@ -4530,9 +4406,12 @@ Use the supplied market and analysis data as the source of truth.`;
         error.message
       );
 
-      res.status(Number(error?.response?.status) || 500).json({
+      res.status(500).json({
         ok: false,
-        error: errorText(error)
+
+        error:
+          error.response?.data ||
+          error.message
       });
     }
   }
