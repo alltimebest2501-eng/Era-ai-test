@@ -63,6 +63,7 @@
 </main></div>
 <nav class="mobile-nav"><button class="active" data-view="home"><span>⌂</span>Home</button><button data-view="trades"><span>▣</span>Trades</button><button data-view="options"><span>▦</span>Options</button><button data-view="news"><span>▤</span>News</button><button data-view="era"><span>✦</span>Era</button></nav>
 <div class="toast-container" id="toastContainer"></div>
+<div class="notification-modal" id="notificationModal"><div class="notification-card"><div class="eyebrow">ERA AI</div><h3>Enable notifications?</h3><p>ERA can alert you about important market moves, trade setups, market close and tomorrow's trade plan.</p><div class="notification-actions"><button class="primary" id="enableNotifications">Enable Notifications</button><button class="later" id="maybeLater">Maybe Later</button></div></div></div>
 <script>
 'use strict';
 const BACKEND=location.origin;
@@ -111,5 +112,5 @@ async function maybeEnableNotifications(){const modal=$('notificationModal');if(
 const themes=[['Cyan','19e6ff','7657ff'],['Violet','9b5cff','ff4fd8'],['Electric Blue','3da5ff','315cff'],['Emerald','28e69b','00b894'],['Lime','b6f36b','20d66b'],['Amber','ffc857','ff7a45'],['Rose','ff5b8a','9b4dff'],['Ice','b8f4ff','5b8cff'],['Aqua','18f1d1','087cff'],['Neon Pink','ff3cac','784ba0'],['Solar','ffcf4a','ff5e5e'],['Royal','6f63ff','00d4ff']];function rgb(h){return[parseInt(h.slice(0,2),16),parseInt(h.slice(2,4),16),parseInt(h.slice(4,6),16)].join(',')}function applyTheme(i){const t=themes[i];document.documentElement.style.setProperty('--accent','#'+t[1]);document.documentElement.style.setProperty('--accent2','#'+t[2]);document.documentElement.style.setProperty('--glow',`rgba(${rgb(t[1])},.25)`);localStorage.setItem('eraTheme',i);document.querySelectorAll('.color').forEach((x,n)=>x.classList.toggle('active',n===i))}themes.forEach((t,i)=>{const b=document.createElement('button');b.className='color';b.title=t[0];b.style.background=`linear-gradient(135deg,#${t[1]},#${t[2]})`;b.onclick=()=>applyTheme(i);$('colorOptions').appendChild(b)});applyTheme(Number(localStorage.getItem('eraTheme')||0));
 (async()=>{await loadAnalysis();setInterval(loadAnalysis,15000);setInterval(()=>{if(document.getElementById('view-news').classList.contains('active'))loadNews()},300000)})();
 </script>
-<div class="notification-modal" id="notificationModal"><div class="notification-card"><div class="eyebrow">ERA AI</div><h3>Enable notifications?</h3><p>ERA can alert you about important market moves, trade setups, market close and tomorrow's trade plan.</p><div class="notification-actions"><button class="primary" id="enableNotifications">Enable Notifications</button><button class="later" id="maybeLater">Maybe Later</button></div></div></div></body>
+</body>
 </html>
