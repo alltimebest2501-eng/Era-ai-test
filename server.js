@@ -12,7 +12,7 @@ const path = require("path");
 const app = express();
 
 const PORT = process.env.PORT || 10000;
-const VERSION = "8.1.6";
+const VERSION = "8.1.7";
 
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
@@ -3415,6 +3415,7 @@ async function monitorMarketState() {
 
   try {
     await refreshMarketData();
+    await notifyMarketCloseAndTomorrowPlan();
 
     if (
       !isMarketHours()
@@ -3513,6 +3514,78 @@ async function monitorMarketState() {
     scannerBusy =
       false;
   }
+}
+
+// ============================================================
+// MARKET CLOSE + TOMORROW PLAN NOTIFICATION
+// ============================================================
+
+function indiaDateKey(offsetDays = 0) {
+  const base = new Date();
+  if (offsetDays) base.setUTCDate(base.getUTCDate() + offsetDays);
+  return base.toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
+}
+
+function buildTomorrowPlan() {
+  const names = ["NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX"];
+  const parts = [];
+  for (const index of names) {
+    const a = state.analysis[index];
+    if (!a) continue;
+    const direction = a.movement?.direction || "WAIT";
+    const confidence = Number(a.confidence);
+    const suggestion = a.suggestion || "WAIT";
+    const trade = Array.isArray(a.trades) ? a.trades[0] : null;
+    let text = `${index}: ${direction}`;
+    if (Number.isFinite(confidence)) text += ` ${confidence}%`;
+    if (trade?.optionType && trade?.strike) text += ` • ${trade.optionType} ${trade.strike}`;
+    else if (suggestion) text += ` • ${suggestion}`;
+    parts.push(text);
+  }
+  return parts.length ? parts.join(" | ") : "Fresh analysis will run before tomorrow's market open.";
+}
+
+async function notifyMarketCloseAndTomorrowPlan() {
+  if (!state.settings.notifications?.marketClose) return;
+  const { weekday, hour, minute } = getIndiaTimeParts();
+  if (!["Mon", "Tue", "Wed", "Thu", "Fri"].includes(weekday)) return;
+  const total = hour * 60 + minute;
+  if (total < 930) return;
+
+  const dateKey = indiaDateKey();
+  if (state.notificationHistory[`market-close:${dateKey}`]) return;
+
+  state.notificationHistory[`market-close:${dateKey}`] = Date.now();
+  saveState();
+
+  const plan = buildTomorrowPlan();
+  await sendPush({
+    title: "Era AI — Market Closed",
+    body: "Market closed for today. Tomorrow's trade plan is ready.",
+    data: { type: "MARKET_CLOSE", date: dateKey }
+  });
+
+  await sendPush({
+    title: "Era AI — Tomorrow Trade Plan",
+    body: plan.slice(0, 240),
+    data: { type: "TOMORROW_PLAN", date: dateKey, plan }
+  });
+
+  state.alerts.unshift({
+    id: `${Date.now()}-market-close`,
+    type: "MARKET_CLOSE",
+    title: "Market Closed",
+    body: "Market closed for today. Tomorrow's trade plan is ready.",
+    createdAt: nowISO()
+  }, {
+    id: `${Date.now()}-tomorrow-plan`,
+    type: "TOMORROW_PLAN",
+    title: "Tomorrow Trade Plan",
+    body: plan,
+    createdAt: nowISO()
+  });
+  state.alerts = state.alerts.slice(0, 100);
+  saveState();
 }
 
 // ============================================================
@@ -3703,29 +3776,15 @@ async function preMarketCheck() {
 app.get(
   "/",
   (req, res) => {
-    res.json({
-      ok: true,
-
-      app:
-        "Era AI",
-
-      version:
-        VERSION,
-
-      status:
-        "running",
-
-      marketOpen:
-        isMarketHours(),
-
-      backend:
-        BACKEND_URL,
-
-      updatedAt:
-        nowISO()
-    });
+    const rootIndex = path.join(__dirname, "index.html");
+    if (fs.existsSync(rootIndex)) return res.sendFile(rootIndex);
+    const publicIndex = path.join(__dirname, "public", "index.html");
+    if (fs.existsSync(publicIndex)) return res.sendFile(publicIndex);
+    res.status(404).send("Era AI UI not found");
   }
 );
+
+app.use(express.static(path.join(__dirname, "public")));
 
 // ============================================================
 // HEALTH
@@ -4339,12 +4398,17 @@ Use the supplied market and analysis data as the source of truth.`;
           }
         );
 
+      const rawAnswer =
+        response.data?.choices?.[0]?.message?.content;
+
       const answer =
-        response.data
-          ?.choices?.[0]
-          ?.message
-          ?.content ||
-        "No response.";
+        typeof rawAnswer === "string"
+          ? rawAnswer.trim()
+          : Array.isArray(rawAnswer)
+            ? rawAnswer.map(part => typeof part === "string"
+              ? part
+              : part?.text || part?.content || "").filter(Boolean).join("\n").trim()
+            : rawAnswer?.text || rawAnswer?.content || rawAnswer?.answer || "No response.";
 
       state.history.unshift({
         type: "chat",
