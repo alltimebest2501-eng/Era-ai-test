@@ -1,1 +1,17 @@
-self.addEventListener("push", event => { let data={title:"Era AI",body:"New ERA AI notification",data:{}}; try{data=event.data?event.data.json():data}catch(e){} event.waitUntil(self.registration.showNotification(data.title||"Era AI",{body:data.body||"",icon:"/favicon.ico",badge:"/favicon.ico",data:data.data||{}})); }); self.addEventListener("notificationclick", event => { event.notification.close(); event.waitUntil(clients.matchAll({type:"window",includeUncontrolled:true}).then(list=>{for(const c of list){if("focus" in c)return c.focus()}return clients.openWindow("/")})); });
+self.addEventListener('push', event => {
+  let data = {};
+  try { data = event.data ? event.data.json() : {}; } catch (_) { data = { body: event.data ? event.data.text() : '' }; }
+  const title = data.title || 'Era AI';
+  const options = {
+    body: data.body || 'New ERA AI market update',
+    data: data.data || {}
+  };
+  event.waitUntil(self.registration.showNotification(title, options));
+});
+self.addEventListener('notificationclick', event => {
+  event.notification.close();
+  event.waitUntil(clients.matchAll({ type: 'window', includeUncontrolled: true }).then(list => {
+    for (const client of list) { if ('focus' in client) return client.focus(); }
+    return clients.openWindow('/');
+  }));
+});
