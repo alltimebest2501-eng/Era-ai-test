@@ -3410,16 +3410,21 @@ async function notifyMarketCloseAndPlan() {
   const dateKey = indiaDateKey();
   if (state.notificationHistory?.marketCloseDate === dateKey) return;
 
-  const plan = Object.entries(state.analysis || {}).map(([index, a]) => {
-    const trade = Array.isArray(a?.trades) ? a.trades[0] : null;
-    return trade ? `${index}: ${trade.optionType || ""} ${trade.strike || ""} (${trade.status || "SETUP"})` : `${index}: ${a?.suggestion || "WAIT"}`;
-  }).join(" • ");
+  const plan = Object.entries(state.analysis || {})
+    .map(([index, a]) => {
+      const trade = Array.isArray(a?.trades) ? a.trades[0] : null;
+      return trade
+        ? `${index}: ${trade.optionType || ""} ${trade.strike || ""} (${trade.status || "SETUP"})`
+        : `${index}: ${a?.suggestion || "WAIT"}`;
+    })
+    .join(" • ");
 
   await sendPush({
     title: "Era AI — Market Closed",
     body: "Indian market session is closed.",
     data: { type: "MARKET_CLOSED", date: dateKey }
   });
+
   await sendPush({
     title: "Era AI — Tomorrow Trade Plan",
     body: plan || "WAIT for confirmation tomorrow. No confirmed setup is available yet.",
@@ -3452,14 +3457,20 @@ async function monitorMarketState() {
     if (
       !isMarketHours()
     ) {
-      state.lastScan = nowISO();
+      state.lastScan =
+        nowISO();
+
       const india = getIndiaTimeParts();
-      const weekdayOpen = ["Mon","Tue","Wed","Thu","Fri"].includes(india.weekday);
+      const weekdayOpen = ["Mon", "Tue", "Wed", "Thu", "Fri"].includes(india.weekday);
       const afterClose = india.hour * 60 + india.minute > 930;
       if (weekdayOpen && afterClose) {
-        try { await notifyMarketCloseAndPlan(); }
-        catch (notificationError) { console.error("[ERA] Market-close notification:", notificationError.message); }
+        try {
+          await notifyMarketCloseAndPlan();
+        } catch (notificationError) {
+          console.error("[ERA] Market-close notification:", notificationError.message);
+        }
       }
+
       return;
     }
 
@@ -4270,48 +4281,69 @@ app.post(
   "/api/chat",
   async (req, res) => {
     try {
-      if (!OPENROUTER_API_KEY) return res.status(503).json({ ok:false, error:"OPENROUTER_API_KEY is not configured" });
+      if (!OPENROUTER_API_KEY) {
+        return res.status(503).json({ ok: false, error: "OPENROUTER_API_KEY is not configured" });
+      }
 
       const message = String(req.body?.message || "").trim();
-      const image = typeof req.body?.image === "string" && req.body.image.startsWith("data:image/") ? req.body.image : null;
-      if (!message && !image) return res.status(400).json({ ok:false, error:"Message or image is required" });
+      const image = typeof req.body?.image === "string" && req.body.image.startsWith("data:image/")
+        ? req.body.image : null;
+
+      if (!message && !image) {
+        return res.status(400).json({ ok: false, error: "Message or image is required" });
+      }
 
       const systemPrompt = `You are Era AI, a friendly human-like Indian market assistant.
-Reply naturally and conversationally in simple Roman Hindi / Hinglish unless another language is requested.
-Answer the actual question first. Never return JSON/code unless requested.
+Reply naturally in simple Roman Hindi / Hinglish unless another language is requested.
+Answer the user's actual question first. Do not return JSON, code, or a giant report unless requested.
 For trade setups, state CE/PE, strike, entry, stop loss, targets, confidence and status when available, and explain WHY.
 Never invent live prices, signals or certainty. If data is insufficient, say WAIT / DATA UNAVAILABLE.
 Use supplied market and analysis data as the source of truth.`;
 
       const compactAnalysis = {};
       for (const [index, a] of Object.entries(state.analysis || {})) {
-        compactAnalysis[index] = { suggestion:a?.suggestion||null, movement:a?.movement||null, confidence:a?.confidence??null, structure:a?.structure||null, trades:Array.isArray(a?.trades)?a.trades.slice(0,3):[] };
+        compactAnalysis[index] = {
+          suggestion: a?.suggestion || null,
+          movement: a?.movement || null,
+          confidence: a?.confidence ?? null,
+          structure: a?.structure || null,
+          trades: Array.isArray(a?.trades) ? a.trades.slice(0, 3) : []
+        };
       }
-      const userContext = { market:state.market, analysis:compactAnalysis, message:message || "[Image analysis request]" };
-      const content = [{ type:"text", text:JSON.stringify(userContext) }];
-      if (image) content.push({ type:"image_url", image_url:{ url:image } });
+
+      const userContext = { market: state.market, analysis: compactAnalysis, message: message || "[Image analysis request]" };
+      const content = [{ type: "text", text: JSON.stringify(userContext) }];
+      if (image) content.push({ type: "image_url", image_url: { url: image } });
 
       const response = await axios.post(
         "https://openrouter.ai/api/v1/chat/completions",
-        { model:OPENROUTER_MODEL, messages:[{role:"system",content:systemPrompt},{role:"user",content:image?content:JSON.stringify(userContext)}], temperature:0.2, max_tokens:4096 },
-        { timeout:30000, headers:{ Authorization:`Bearer ${OPENROUTER_API_KEY}`, "Content-Type":"application/json", "HTTP-Referer":BACKEND_URL, "X-Title":"Era AI" } }
+        {
+          model: OPENROUTER_MODEL,
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: image ? content : JSON.stringify(userContext) }
+          ],
+          temperature: 0.2,
+          max_tokens: 4096
+        },
+        { timeout: 30000, headers: { Authorization: `Bearer ${OPENROUTER_API_KEY}`, "Content-Type": "application/json", "HTTP-Referer": BACKEND_URL, "X-Title": "Era AI" } }
       );
 
-      const raw=response.data?.choices?.[0]?.message?.content;
-      let answer="";
-      if(typeof raw==="string") answer=raw.trim();
-      else if(Array.isArray(raw)) answer=raw.map(x=>typeof x==="string"?x:(x?.text||x?.content||x?.answer||"")).filter(Boolean).join("\n").trim();
-      else if(raw && typeof raw==="object") answer=raw.answer||raw.text||raw.content||raw.message||"";
-      if(!answer) answer="ERA ko is request ka readable response nahi mila.";
+      const raw = response.data?.choices?.[0]?.message?.content;
+      let answer = "";
+      if (typeof raw === "string") answer = raw.trim();
+      else if (Array.isArray(raw)) answer = raw.map(item => typeof item === "string" ? item : item?.text || item?.content || "").filter(Boolean).join("\n").trim();
+      else if (raw && typeof raw === "object") answer = raw.text || raw.content || raw.answer || "";
+      if (!answer) answer = "ERA ko is request ka readable response nahi mila.";
 
-      state.history.unshift({type:"chat",userMessage:message||"[Image]",answer,index:req.body?.index||null,createdAt:nowISO()});
-      state.history=state.history.slice(0,500);
+      state.history.unshift({ type: "chat", userMessage: message || "[Image]", answer, index: req.body?.index || null, createdAt: nowISO() });
+      state.history = state.history.slice(0, 500);
       saveState();
-      res.json({ok:true,answer});
-    } catch(error) {
-      console.error("[ERA] Chat error:",error.response?.data||error.message);
-      const detail=error.response?.data?.error?.message||error.response?.data?.error||error.response?.data?.message||error.message||"ERA chat request failed";
-      res.status(500).json({ok:false,error:typeof detail==="string"?detail:JSON.stringify(detail)});
+      res.json({ ok: true, answer });
+    } catch (error) {
+      console.error("[ERA] Chat error:", error.response?.data || error.message);
+      const detail = error.response?.data?.error?.message || error.response?.data?.error || error.response?.data?.message || error.message || "ERA chat request failed";
+      res.status(500).json({ ok: false, error: typeof detail === "string" ? detail : JSON.stringify(detail) });
     }
   }
 );
