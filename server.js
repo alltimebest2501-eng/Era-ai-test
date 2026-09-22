@@ -12,7 +12,7 @@ const path = require("path");
 const app = express();
 
 const PORT = process.env.PORT || 10000;
-const VERSION = "8.1.6";
+const VERSION = "8.1.7";
 
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
@@ -267,7 +267,8 @@ const state = {
       movement: true,
       tradeSetup: true,
       news: true,
-      marketClose: true
+      marketClose: true,
+      tomorrowPlan: true
     }
   }
 };
@@ -3425,6 +3426,132 @@ async function notifyMarketMove(
 }
 
 // ============================================================
+// MARKET SESSION NOTIFICATIONS
+// ============================================================
+
+function indiaDateKey() {
+  return new Date().toLocaleDateString("en-CA", {
+    timeZone: "Asia/Kolkata"
+  });
+}
+
+function previousTradingDateKey() {
+  const d = new Date();
+  d.setUTCDate(d.getUTCDate() - 1);
+  return d.toLocaleDateString("en-CA", {
+    timeZone: "Asia/Kolkata"
+  });
+}
+
+function tomorrowLabel() {
+  const d = new Date();
+  d.setUTCDate(d.getUTCDate() + 1);
+  return d.toLocaleDateString("en-IN", {
+    timeZone: "Asia/Kolkata",
+    weekday: "short",
+    day: "2-digit",
+    month: "short"
+  });
+}
+
+function buildTomorrowPlan() {
+  const names = {
+    NIFTY: "NIFTY",
+    BANKNIFTY: "BANK NIFTY",
+    FINNIFTY: "FIN NIFTY",
+    SENSEX: "SENSEX"
+  };
+
+  const parts = [];
+  for (const index of Object.keys(names)) {
+    const a = state.analysis[index];
+    const m = state.market[index];
+    if (!a) continue;
+
+    const direction = a.movement?.direction || "SIDEWAYS";
+    const confidence = Number(a.confidence || 0);
+    const trade = Array.isArray(a.trades) ? a.trades[0] : null;
+    const price = Number(m?.price);
+
+    let line = `${names[index]}: ${direction}`;
+    if (Number.isFinite(price) && price > 0) line += ` near ${round(price)}`;
+    if (trade) {
+      line += ` | ${trade.optionType} ${trade.strike} setup`;
+    } else {
+      line += ` | WAIT for confirmation`;
+    }
+    line += ` | ${confidence}% confidence`;
+    parts.push(line);
+  }
+
+  if (!parts.length) {
+    return `Tomorrow (${tomorrowLabel()}): Live analysis was not available at market close. WAIT for fresh confirmation after 09:15 IST.`;
+  }
+
+  return `Tomorrow (${tomorrowLabel()}): ${parts.join(" • ")}`;
+}
+
+async function notifyMarketOpenOnce() {
+  if (!state.settings.notifications?.marketOpen) return;
+  const dateKey = indiaDateKey();
+  const key = `market-open:${dateKey}`;
+  if (state.notificationHistory[key]) return;
+
+  state.notificationHistory[key] = Date.now();
+  saveState();
+  await sendPush({
+    title: "Era AI — Market Open",
+    body: "Market is live. ERA is monitoring NIFTY, BANK NIFTY, FIN NIFTY and SENSEX.",
+    data: { type: "MARKET_OPEN", date: dateKey }
+  });
+}
+
+async function notifyMarketCloseOnce() {
+  if (!state.settings.notifications?.marketClose) return;
+  const dateKey = indiaDateKey();
+  const key = `market-close:${dateKey}`;
+  if (state.notificationHistory[key]) return;
+
+  state.notificationHistory[key] = Date.now();
+  saveState();
+  await sendPush({
+    title: "Era AI — Market Closed",
+    body: "Market is closed. ERA has prepared the next-day trade plan.",
+    data: { type: "MARKET_CLOSE", date: dateKey }
+  });
+}
+
+async function notifyTomorrowPlanOnce() {
+  if (!state.settings.notifications?.tomorrowPlan) return;
+  const dateKey = indiaDateKey();
+  const key = `tomorrow-plan:${dateKey}`;
+  if (state.notificationHistory[key]) return;
+
+  const plan = buildTomorrowPlan();
+  state.notificationHistory[key] = Date.now();
+  saveState();
+  await sendPush({
+    title: "Era AI — Tomorrow Trade Plan",
+    body: plan,
+    data: {
+      type: "TOMORROW_TRADE_PLAN",
+      date: dateKey,
+      plan
+    }
+  });
+}
+
+async function handleClosedSessionNotifications() {
+  const { weekday, hour, minute } = getIndiaTimeParts();
+  if (!["Mon", "Tue", "Wed", "Thu", "Fri"].includes(weekday)) return;
+  const total = hour * 60 + minute;
+  if (total < 931) return;
+
+  await notifyMarketCloseOnce();
+  await notifyTomorrowPlanOnce();
+}
+
+// ============================================================
 // MONITOR MARKET
 // ============================================================
 
@@ -3442,14 +3569,13 @@ async function monitorMarketState() {
   try {
     await refreshMarketData();
 
-    if (
-      !isMarketHours()
-    ) {
-      state.lastScan =
-        nowISO();
-
+    if (!isMarketHours()) {
+      state.lastScan = nowISO();
+      await handleClosedSessionNotifications();
       return;
     }
+
+    await notifyMarketOpenOnce();
 
     const indices =
       Object.keys(
@@ -4342,7 +4468,10 @@ Use the supplied market and analysis data as the source of truth.`;
             ],
 
             temperature:
-              0.2
+              0.2,
+
+            max_tokens:
+              4096
           },
 
           {
