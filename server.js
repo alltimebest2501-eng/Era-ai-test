@@ -68,6 +68,10 @@ function normalizeAuthEmail(value) {
   return String(value || "").trim().toLowerCase();
 }
 
+function getEraUserId(req) {
+  return normalizeAuthEmail(req.headers["x-era-user"] || req.body?.userId || "guest");
+}
+
 function isValidEmail(value) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizeAuthEmail(value));
 }
@@ -3399,6 +3403,47 @@ async function notifyMarketMove(
 }
 
 // ============================================================
+// MARKET CLOSE + TOMORROW PLAN NOTIFICATIONS
+// ============================================================
+
+function indiaDateKey() {
+  return new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
+}
+
+async function notifyMarketCloseAndPlan() {
+  const dateKey = indiaDateKey();
+  if (state.notificationHistory.marketCloseDate === dateKey) return;
+
+  const active = Object.values(state.analysis || {})
+    .flatMap(a => Array.isArray(a?.trades) ? a.trades : []);
+
+  const plan = Object.entries(state.analysis || {})
+    .map(([index, a]) => {
+      const trade = a?.trades?.[0];
+      if (trade) return `${index}: ${trade.optionType || ""} ${trade.strike || ""} (${trade.status || "SETUP"})`;
+      return `${index}: ${a?.suggestion || "WAIT"}`;
+    })
+    .join(" • ");
+
+  if (state.settings.notifications?.marketClose !== false) {
+    await sendPush({
+      title: "Era AI — Market Closed",
+      body: "Indian market session is closed. ERA has prepared the next-day trade plan.",
+      data: { type: "MARKET_CLOSED", date: dateKey }
+    });
+
+    await sendPush({
+      title: "Era AI — Tomorrow Trade Plan",
+      body: plan || "WAIT for confirmation tomorrow. No confirmed setup is available yet.",
+      data: { type: "TOMORROW_TRADE_PLAN", date: dateKey, activeTrades: active }
+    });
+  }
+
+  state.notificationHistory.marketCloseDate = dateKey;
+  saveState();
+}
+
+// ============================================================
 // MONITOR MARKET
 // ============================================================
 
@@ -3421,6 +3466,14 @@ async function monitorMarketState() {
     ) {
       state.lastScan =
         nowISO();
+
+      const { weekday, hour, minute } = getIndiaTimeParts();
+      const totalMinutes = hour * 60 + minute;
+      if (["Mon", "Tue", "Wed", "Thu", "Fri"].includes(weekday) && totalMinutes >= 930) {
+        try { await notifyMarketCloseAndPlan(); } catch (notifyError) {
+          console.error("[ERA] Market close notification:", notifyError.message);
+        }
+      }
 
       return;
     }
@@ -4002,9 +4055,18 @@ app.get(
           "NIFTY"
         );
 
-      const expiry =
+      const requestedExpiry =
         req.query.expiry ||
         null;
+
+      const contracts = await fetchOptionContracts(index);
+      const today = new Date().toISOString().slice(0, 10);
+      const expiries = [...new Set(contracts.map(item => item.expiry).filter(Boolean))]
+        .filter(expiry => expiry >= today)
+        .sort();
+      const expiry = requestedExpiry && expiries.includes(requestedExpiry)
+        ? requestedExpiry
+        : (expiries[0] || null);
 
       if (!INDICES[index]) {
         return res.status(400)
@@ -4113,6 +4175,8 @@ app.get(
 
         expiry:
           chain.expiry,
+
+        expiries,
 
         spot:
 
@@ -4249,8 +4313,12 @@ app.post(
           req.body?.message ||
           ""
         ).trim();
+      const image = typeof req.body?.image === "string" && req.body.image.startsWith("data:image/")
+        ? req.body.image
+        : null;
+      const userId = getEraUserId(req);
 
-      if (!message) {
+      if (!message && !image) {
         return res.status(400)
           .json({
             ok: false,
@@ -4277,46 +4345,18 @@ Important style rules:
 
 Use the supplied market and analysis data as the source of truth.`;
 
-      // Keep the OpenRouter prompt small. The full state.analysis object can contain
-      // large option/technical arrays; sending it repeatedly caused 44k+ token failures.
-      const requestedIndex = String(req.body?.index || "NIFTY").toUpperCase();
-      const index = INDICES[requestedIndex] ? requestedIndex : "NIFTY";
-      const m = state.market?.[index] || {};
-      const a = state.analysis?.[index] || {};
-      const t = a.technical || {};
-      const o = a.options || {};
-      const compactTrades = Array.isArray(a.trades) ? a.trades.slice(0, 3).map(x => ({
-        optionType: x.optionType, strike: x.strike, entry: x.entry,
-        stopLoss: x.stopLoss, targets: Array.isArray(x.targets) ? x.targets.slice(0, 3) : [],
-        confidence: x.confidence, status: x.status
-      })) : [];
-      const compactContext = {
-        index,
-        market: {
-          name: m.name, price: m.price, previousClose: m.previousClose,
-          change: m.change, changePercent: m.changePercent, open: m.open,
-          high: m.high, low: m.low, volume: m.volume, timestamp: m.timestamp,
-          source: m.source, stale: m.stale
-        },
-        analysis: {
-          direction: a.direction, movement: a.movement, confidence: a.confidence,
-          suggestion: a.suggestion, reasons: Array.isArray(a.reasons) ? a.reasons.slice(0, 5) : [],
-          risks: Array.isArray(a.risks) ? a.risks.slice(0, 5) : [],
-          technical: {
-            emaTrend: t.emaTrend, rsi: t.rsi, vwap: t.vwap,
-            structure: t.structure?.label || t.structure,
-            bos: t.bos, choch: t.choch
-          },
-          options: {
-            pcr: o.pcr, sentiment: o.sentiment,
-            callOI: o.callOI, putOI: o.putOI
-          },
-          trades: compactTrades
-        },
-        message
+      const userContext = {
+        market: state.market,
+        analysis: state.analysis,
+        message: message || "Analyze the attached market screenshot."
       };
 
-      const userContext = compactContext;
+      const userContent = image
+        ? [
+            { type: "text", text: JSON.stringify(userContext) },
+            { type: "image_url", image_url: { url: image } }
+          ]
+        : JSON.stringify(userContext);
 
       const response =
         await axios.post(
@@ -4336,13 +4376,8 @@ Use the supplied market and analysis data as the source of truth.`;
               },
 
               {
-                role:
-                  "user",
-
-                content:
-                  JSON.stringify(
-                    userContext
-                  )
+                role: "user",
+                content: userContent
               }
             ],
 
@@ -4382,7 +4417,8 @@ Use the supplied market and analysis data as the source of truth.`;
 
       state.history.unshift({
         type: "chat",
-        userMessage: message,
+        userId,
+        userMessage: message || "[Screenshot]",
         answer,
         index: req.body?.index || null,
         createdAt: nowISO()
@@ -4541,11 +4577,11 @@ app.post(
 app.get(
   "/api/history",
   (req, res) => {
+    const userId = getEraUserId(req);
+    const history = state.history.filter(item => item.userId === userId);
     res.json({
       ok: true,
-
-      history:
-        state.history
+      history
     });
   }
 );
@@ -4561,8 +4597,17 @@ app.post(
       const trade =
         req.body || {};
 
+      const userId = getEraUserId(req);
+      const tradeKey = trade.historyKey || [trade.index, trade.optionType, trade.strike, trade.signal, trade.entry].join("|");
+      const existing = state.history.find(item => item.userId === userId && item.type === "trade" && item.historyKey === tradeKey);
+      if (existing) {
+        return res.json({ ok: true, trade: existing });
+      }
+
       const record = {
         ...trade,
+        userId,
+        historyKey: tradeKey,
 
         id:
           trade.id ||
