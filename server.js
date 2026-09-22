@@ -6,14 +6,13 @@ const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
 const webpush = require("web-push");
-const nodemailer = require("nodemailer");
 const fs = require("fs");
 const path = require("path");
 
 const app = express();
 
 const PORT = process.env.PORT || 10000;
-const VERSION = "8.1.5";
+const VERSION = "8.1.6";
 
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
@@ -84,27 +83,36 @@ function maskEmail(email) {
 }
 
 async function sendEmailOtp(email, otp) {
-  const user = process.env.SMTP_USER;
-  const pass = process.env.SMTP_PASS;
-  if (!user || !pass) throw new Error("Gmail OTP is not configured on Render. Add SMTP_USER and SMTP_PASS.");
+  const apiKey = process.env.RESEND_API_KEY;
+  if (!apiKey) {
+    throw new Error("Resend is not configured. Add RESEND_API_KEY in Render Environment.");
+  }
 
-  const transporter = nodemailer.createTransport({
-    host: process.env.SMTP_HOST || "smtp.gmail.com",
-    port: Number(process.env.SMTP_PORT || 587),
-    secure: Number(process.env.SMTP_PORT || 587) === 465,
-    auth: { user, pass },
-    connectionTimeout: 15000,
-    greetingTimeout: 15000,
-    socketTimeout: 20000
-  });
+  const fromEmail = process.env.RESEND_FROM_EMAIL || "onboarding@resend.dev";
+  const fromName = process.env.RESEND_FROM_NAME || "ERA AI";
 
-  await transporter.sendMail({
-    from: `ERA AI <${user}>`,
-    to: email,
-    subject: `${otp} is your ERA AI login OTP`,
-    text: `Your ERA AI login OTP is ${otp}. It expires in 5 minutes. If you did not request this, ignore this email.`,
-    html: `<div style="font-family:Arial,sans-serif"><h2>ERA AI Login</h2><p>Your 6-digit OTP is:</p><div style="font-size:32px;font-weight:700;letter-spacing:8px">${otp}</div><p>This OTP expires in 5 minutes.</p></div>`
-  });
+  const response = await axios.post(
+    "https://api.resend.com/emails",
+    {
+      from: `${fromName} <${fromEmail}>`,
+      to: [email],
+      subject: `${otp} is your ERA AI login OTP`,
+      text: `Your ERA AI login OTP is ${otp}. It expires in 5 minutes. If you did not request this, ignore this email.`,
+      html: `<div style="font-family:Arial,sans-serif;max-width:520px;margin:auto;padding:24px"><h2>ERA AI Login</h2><p>Your 6-digit OTP is:</p><div style="font-size:34px;font-weight:700;letter-spacing:8px;padding:16px 0">${otp}</div><p>This OTP expires in 5 minutes.</p><p style="color:#777">If you did not request this code, you can ignore this email.</p></div>`
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json"
+      },
+      timeout: 15000
+    }
+  );
+
+  if (!response.data?.id) {
+    throw new Error("Resend did not accept the email request.");
+  }
+  return response.data;
 }
 
 app.post("/api/auth/send-otp", async (req, res) => {
