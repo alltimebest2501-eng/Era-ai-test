@@ -1,6 +1,6 @@
 {
   "name": "era-ai",
-  "version": "8.1.5",
+  "version": "8.1.6",
   "description": "Era AI - Autonomous Indian Market Intelligence and Options Analysis Platform",
   "main": "server.js",
   "scripts": {
@@ -14,7 +14,6 @@
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
-    "nodemailer": "^7.0.6",
     "web-push": "^3.0.0"
   }
 }
