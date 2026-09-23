@@ -12,7 +12,7 @@ const path = require("path");
 const app = express();
 
 const PORT = process.env.PORT || 10000;
-const VERSION = "8.2.0";
+const VERSION = "8.2.6";
 
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
@@ -1709,7 +1709,8 @@ function detectStructure(
 
 function technicalAnalysis(
   candles,
-  price
+  price,
+  market = null
 ) {
   if (
     !Array.isArray(candles) ||
@@ -1811,6 +1812,49 @@ function technicalAnalysis(
       candles
     );
 
+  const latestCandle =
+    candles[candles.length - 1] || null;
+
+  const latestCandleVolume =
+    latestCandle ? Number(latestCandle[5]) : 0;
+
+  const marketVolume =
+    market ? Number(market.volume) : 0;
+
+  const volume =
+    Number.isFinite(latestCandleVolume) && latestCandleVolume > 0
+      ? latestCandleVolume
+      : Number.isFinite(marketVolume) && marketVolume > 0
+        ? marketVolume
+        : null;
+
+  let vwap =
+    calculateVWAP(candles);
+
+  let vwapSource =
+    vwap !== null ? "volume-weighted" : "";
+
+  // Index candles can report zero volume. In that case use the quote's
+  // average price, then a session typical-price average as a clearly
+  // identified fallback so the indicator never silently shows blank.
+  if (vwap === null && market) {
+    const averagePrice = Number(market.averagePrice);
+    if (Number.isFinite(averagePrice) && averagePrice > 0) {
+      vwap = averagePrice;
+      vwapSource = "quote-average-price";
+    }
+  }
+
+  if (vwap === null && candles.length) {
+    const typicals = candles
+      .map(c => (Number(c[2]) + Number(c[3]) + Number(c[4])) / 3)
+      .filter(Number.isFinite);
+    if (typicals.length) {
+      vwap = typicals.reduce((a, b) => a + b, 0) / typicals.length;
+      vwapSource = "typical-price-proxy";
+    }
+  }
+
   return {
     candleCount:
       candles.length,
@@ -1836,9 +1880,12 @@ function technicalAnalysis(
       ),
 
     vwap:
-      calculateVWAP(
-        candles
-      ),
+      vwap !== null ? round(vwap) : null,
+
+    vwapSource,
+
+    volume:
+      volume !== null ? round(volume, 0) : null,
 
     support:
       round(support),
@@ -2744,16 +2791,17 @@ function calculateConfidence(
       95
     );
 
+  const tradeMinConfidence = 61;
   let suggestion;
 
   if (
-    confidence >= 75 &&
+    confidence >= tradeMinConfidence &&
     movement.significant
   ) {
     suggestion =
       "TRADE CONSIDER";
   } else if (
-    confidence >= 60
+    confidence >= tradeMinConfidence
   ) {
     suggestion =
       "WAIT FOR CONFIRMATION";
@@ -2801,8 +2849,8 @@ function createOptionTrades(
   }
 
   if (
-    confidenceData.confidence <=
-    60
+    confidenceData.confidence <
+    61
   ) {
     return [];
   }
@@ -2952,7 +3000,9 @@ function createOptionTrades(
     });
   }
 
-  return trades.slice(0, 3);
+  return trades
+    .filter(t => Number(t?.confidence || 0) > 60)
+    .slice(0, 3);
 }
 
 // ============================================================
