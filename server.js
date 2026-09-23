@@ -12,7 +12,7 @@ const path = require("path");
 const app = express();
 
 const PORT = process.env.PORT || 10000;
-const VERSION = "8.1.6";
+const VERSION = "8.2.0";
 
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
@@ -26,6 +26,15 @@ app.get("/", (req, res) => {
   if (fs.existsSync(publicIndex)) return res.sendFile(publicIndex);
   res.status(404).send("Era AI UI not found");
 });
+
+// Root-level PWA assets are explicitly served because the ERA UI is deployed from index.html at the project root.
+for (const asset of ["service-worker.js", "manifest.json", "icon-192.png", "icon-512.png"]) {
+  app.get(`/${asset}`, (req, res) => {
+    const file = path.join(__dirname, asset);
+    if (fs.existsSync(file)) return res.sendFile(file);
+    res.status(404).end();
+  });
+}
 
 app.use(express.static(path.join(__dirname, "public")));
 
@@ -66,10 +75,6 @@ const AUTH_RESEND_MS = 10 * 1000;
 
 function normalizeAuthEmail(value) {
   return String(value || "").trim().toLowerCase();
-}
-
-function getEraUserId(req) {
-  return normalizeAuthEmail(req.headers["x-era-user"] || req.body?.userId || "guest");
 }
 
 function isValidEmail(value) {
@@ -273,6 +278,26 @@ const state = {
       news: true,
       marketClose: true
     }
+  },
+
+  paper: {
+    startingCapital: 100000,
+    cash: 100000,
+    positions: [],
+    orders: [],
+    realizedPnl: 0
+  },
+
+  journal: [],
+
+  risk: {
+    riskPerTrade: 1,
+    maxDailyLoss: 2,
+    maxTradeLoss: 1,
+    maxPositions: 3,
+    maxTradesPerDay: 5,
+    maxExposure: 50,
+    killSwitch: false
   }
 };
 
@@ -344,6 +369,13 @@ function loadState() {
       state.notificationHistory = saved.notificationHistory;
     }
 
+    if (saved.paper && typeof saved.paper === "object") {
+      state.paper = { ...state.paper, ...saved.paper, positions: Array.isArray(saved.paper.positions) ? saved.paper.positions : [], orders: Array.isArray(saved.paper.orders) ? saved.paper.orders : [] };
+    }
+
+    if (Array.isArray(saved.journal)) state.journal = saved.journal;
+    if (saved.risk && typeof saved.risk === "object") state.risk = { ...state.risk, ...saved.risk };
+
   } catch (error) {
     console.error(
       "[ERA] State load error:",
@@ -371,7 +403,16 @@ function saveState() {
             state.settings,
 
           notificationHistory:
-            state.notificationHistory
+            state.notificationHistory,
+
+          paper:
+            state.paper,
+
+          journal:
+            state.journal,
+
+          risk:
+            state.risk
         },
         null,
         2
@@ -3403,47 +3444,6 @@ async function notifyMarketMove(
 }
 
 // ============================================================
-// MARKET CLOSE + TOMORROW PLAN NOTIFICATIONS
-// ============================================================
-
-function indiaDateKey() {
-  return new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
-}
-
-async function notifyMarketCloseAndPlan() {
-  const dateKey = indiaDateKey();
-  if (state.notificationHistory.marketCloseDate === dateKey) return;
-
-  const active = Object.values(state.analysis || {})
-    .flatMap(a => Array.isArray(a?.trades) ? a.trades : []);
-
-  const plan = Object.entries(state.analysis || {})
-    .map(([index, a]) => {
-      const trade = a?.trades?.[0];
-      if (trade) return `${index}: ${trade.optionType || ""} ${trade.strike || ""} (${trade.status || "SETUP"})`;
-      return `${index}: ${a?.suggestion || "WAIT"}`;
-    })
-    .join(" • ");
-
-  if (state.settings.notifications?.marketClose !== false) {
-    await sendPush({
-      title: "Era AI — Market Closed",
-      body: "Indian market session is closed. ERA has prepared the next-day trade plan.",
-      data: { type: "MARKET_CLOSED", date: dateKey }
-    });
-
-    await sendPush({
-      title: "Era AI — Tomorrow Trade Plan",
-      body: plan || "WAIT for confirmation tomorrow. No confirmed setup is available yet.",
-      data: { type: "TOMORROW_TRADE_PLAN", date: dateKey, activeTrades: active }
-    });
-  }
-
-  state.notificationHistory.marketCloseDate = dateKey;
-  saveState();
-}
-
-// ============================================================
 // MONITOR MARKET
 // ============================================================
 
@@ -3466,14 +3466,6 @@ async function monitorMarketState() {
     ) {
       state.lastScan =
         nowISO();
-
-      const { weekday, hour, minute } = getIndiaTimeParts();
-      const totalMinutes = hour * 60 + minute;
-      if (["Mon", "Tue", "Wed", "Thu", "Fri"].includes(weekday) && totalMinutes >= 930) {
-        try { await notifyMarketCloseAndPlan(); } catch (notifyError) {
-          console.error("[ERA] Market close notification:", notifyError.message);
-        }
-      }
 
       return;
     }
@@ -4055,18 +4047,9 @@ app.get(
           "NIFTY"
         );
 
-      const requestedExpiry =
+      const expiry =
         req.query.expiry ||
         null;
-
-      const contracts = await fetchOptionContracts(index);
-      const today = new Date().toISOString().slice(0, 10);
-      const expiries = [...new Set(contracts.map(item => item.expiry).filter(Boolean))]
-        .filter(expiry => expiry >= today)
-        .sort();
-      const expiry = requestedExpiry && expiries.includes(requestedExpiry)
-        ? requestedExpiry
-        : (expiries[0] || null);
 
       if (!INDICES[index]) {
         return res.status(400)
@@ -4175,8 +4158,6 @@ app.get(
 
         expiry:
           chain.expiry,
-
-        expiries,
 
         spot:
 
@@ -4313,12 +4294,8 @@ app.post(
           req.body?.message ||
           ""
         ).trim();
-      const image = typeof req.body?.image === "string" && req.body.image.startsWith("data:image/")
-        ? req.body.image
-        : null;
-      const userId = getEraUserId(req);
 
-      if (!message && !image) {
+      if (!message) {
         return res.status(400)
           .json({
             ok: false,
@@ -4345,18 +4322,46 @@ Important style rules:
 
 Use the supplied market and analysis data as the source of truth.`;
 
-      const userContext = {
-        market: state.market,
-        analysis: state.analysis,
-        message: message || "Analyze the attached market screenshot."
+      // Keep the OpenRouter prompt small. The full state.analysis object can contain
+      // large option/technical arrays; sending it repeatedly caused 44k+ token failures.
+      const requestedIndex = String(req.body?.index || "NIFTY").toUpperCase();
+      const index = INDICES[requestedIndex] ? requestedIndex : "NIFTY";
+      const m = state.market?.[index] || {};
+      const a = state.analysis?.[index] || {};
+      const t = a.technical || {};
+      const o = a.options || {};
+      const compactTrades = Array.isArray(a.trades) ? a.trades.slice(0, 3).map(x => ({
+        optionType: x.optionType, strike: x.strike, entry: x.entry,
+        stopLoss: x.stopLoss, targets: Array.isArray(x.targets) ? x.targets.slice(0, 3) : [],
+        confidence: x.confidence, status: x.status
+      })) : [];
+      const compactContext = {
+        index,
+        market: {
+          name: m.name, price: m.price, previousClose: m.previousClose,
+          change: m.change, changePercent: m.changePercent, open: m.open,
+          high: m.high, low: m.low, volume: m.volume, timestamp: m.timestamp,
+          source: m.source, stale: m.stale
+        },
+        analysis: {
+          direction: a.direction, movement: a.movement, confidence: a.confidence,
+          suggestion: a.suggestion, reasons: Array.isArray(a.reasons) ? a.reasons.slice(0, 5) : [],
+          risks: Array.isArray(a.risks) ? a.risks.slice(0, 5) : [],
+          technical: {
+            emaTrend: t.emaTrend, rsi: t.rsi, vwap: t.vwap,
+            structure: t.structure?.label || t.structure,
+            bos: t.bos, choch: t.choch
+          },
+          options: {
+            pcr: o.pcr, sentiment: o.sentiment,
+            callOI: o.callOI, putOI: o.putOI
+          },
+          trades: compactTrades
+        },
+        message
       };
 
-      const userContent = image
-        ? [
-            { type: "text", text: JSON.stringify(userContext) },
-            { type: "image_url", image_url: { url: image } }
-          ]
-        : JSON.stringify(userContext);
+      const userContext = compactContext;
 
       const response =
         await axios.post(
@@ -4376,8 +4381,13 @@ Use the supplied market and analysis data as the source of truth.`;
               },
 
               {
-                role: "user",
-                content: userContent
+                role:
+                  "user",
+
+                content:
+                  JSON.stringify(
+                    userContext
+                  )
               }
             ],
 
@@ -4408,17 +4418,16 @@ Use the supplied market and analysis data as the source of truth.`;
           }
         );
 
-      const answer =
-        response.data
-          ?.choices?.[0]
-          ?.message
-          ?.content ||
-        "No response.";
+      const rawAnswer = response.data?.choices?.[0]?.message?.content;
+      const answer = typeof rawAnswer === "string"
+        ? rawAnswer
+        : Array.isArray(rawAnswer)
+          ? rawAnswer.map(x => typeof x === "string" ? x : (x?.text || x?.content || "")).filter(Boolean).join("\n")
+          : (rawAnswer?.text || rawAnswer?.content || rawAnswer?.answer || "No response.");
 
       state.history.unshift({
         type: "chat",
-        userId,
-        userMessage: message || "[Screenshot]",
+        userMessage: message,
         answer,
         index: req.body?.index || null,
         createdAt: nowISO()
@@ -4445,9 +4454,7 @@ Use the supplied market and analysis data as the source of truth.`;
       res.status(500).json({
         ok: false,
 
-        error:
-          error.response?.data ||
-          error.message
+        error: apiError(error.response?.data || error.message)
       });
     }
   }
@@ -4577,11 +4584,11 @@ app.post(
 app.get(
   "/api/history",
   (req, res) => {
-    const userId = getEraUserId(req);
-    const history = state.history.filter(item => item.userId === userId);
     res.json({
       ok: true,
-      history
+
+      history:
+        state.history
     });
   }
 );
@@ -4597,17 +4604,8 @@ app.post(
       const trade =
         req.body || {};
 
-      const userId = getEraUserId(req);
-      const tradeKey = trade.historyKey || [trade.index, trade.optionType, trade.strike, trade.signal, trade.entry].join("|");
-      const existing = state.history.find(item => item.userId === userId && item.type === "trade" && item.historyKey === tradeKey);
-      if (existing) {
-        return res.json({ ok: true, trade: existing });
-      }
-
       const record = {
         ...trade,
-        userId,
-        historyKey: tradeKey,
 
         id:
           trade.id ||
@@ -4890,6 +4888,163 @@ setInterval(
   state.settings
     .newsIntervalMs
 );
+
+// ============================================================
+// ERA V8.2 FEATURE APIs
+// ============================================================
+
+function apiError(error) {
+  if (!error) return "Unknown error";
+  if (typeof error === "string") return error;
+  if (error.message) return String(error.message);
+  if (error.error?.message) return String(error.error.message);
+  try { return JSON.stringify(error); } catch (_) { return String(error); }
+}
+
+function currentUserKey(req) {
+  const raw = String(req.headers["x-era-user"] || "guest").trim().toLowerCase();
+  return raw.slice(0, 180) || "guest";
+}
+
+function riskCheck(trade) {
+  const r = state.risk;
+  if (r.killSwitch) return { ok: false, reason: "ERA risk kill switch is ON." };
+  if ((state.paper.positions || []).length >= Number(r.maxPositions || 3)) return { ok: false, reason: "Maximum open paper positions reached." };
+  const entry = Number(trade.entry || 0), stop = Number(trade.stopLoss || 0);
+  if (!entry || !stop || entry <= stop) return { ok: false, reason: "Invalid entry/stop values." };
+  const lossPct = ((entry - stop) / entry) * 100;
+  if (lossPct > Number(r.maxTradeLoss || 1) * 2) return { ok: false, reason: "Trade risk exceeds configured limit." };
+  return { ok: true, reason: "Risk checks passed." };
+}
+
+app.get("/api/candles", async (req, res) => {
+  try {
+    const index = normalizeIndex(req.query.index || "NIFTY");
+    const interval = Math.max(1, Math.min(60, Number(req.query.interval || 5)));
+    if (!INDICES[index]) return res.status(400).json({ ok:false, error:"Invalid index" });
+    let candles = await fetchIntradayCandles(index, interval);
+    if (!candles.length) candles = await fetchHistoricalCandles(index, interval);
+    const market = state.market[index];
+    candles = syncLatestCandle(candles, market?.price);
+    res.json({ ok:true, index, interval, candles, updatedAt:nowISO() });
+  } catch (error) {
+    res.status(500).json({ ok:false, error:apiError(error) });
+  }
+});
+
+app.get("/api/opportunities", async (req, res) => {
+  try {
+    if (!Object.keys(state.market).some(k => state.market[k]?.available)) await refreshMarketData();
+    const list = [];
+    for (const index of Object.keys(INDICES)) {
+      const a = state.analysis[index];
+      if (!a?.available) continue;
+      for (const trade of (a.trades || [])) list.push({ ...trade, reasons:a.reasons || [], risks:a.risks || [] });
+      if (!a.trades?.length) list.push({ index, signal:"NO TRADE", status:"WATCH", confidence:a.confidence || 0, reason:a.suggestion || "No validated setup" });
+    }
+    list.sort((a,b)=>Number(b.confidence||0)-Number(a.confidence||0));
+    res.json({ ok:true, opportunities:list.slice(0,20), updatedAt:nowISO() });
+  } catch (error) { res.status(500).json({ok:false,error:apiError(error)}); }
+});
+
+app.get("/api/risk", (req,res)=>res.json({ok:true,risk:state.risk,killSwitch:Boolean(state.risk.killSwitch),updatedAt:nowISO()}));
+app.post("/api/risk", (req,res)=>{
+  try {
+    const b=req.body||{};
+    for (const k of ["riskPerTrade","maxDailyLoss","maxTradeLoss","maxPositions","maxTradesPerDay","maxExposure"]) {
+      if (b[k] !== undefined && Number.isFinite(Number(b[k])) && Number(b[k]) > 0) state.risk[k]=Number(b[k]);
+    }
+    if (b.killSwitch !== undefined) state.risk.killSwitch=Boolean(b.killSwitch);
+    saveState(); res.json({ok:true,risk:state.risk});
+  } catch(error){res.status(400).json({ok:false,error:apiError(error)});}
+});
+
+app.get("/api/paper", (req,res)=>res.json({ok:true,paper:state.paper,risk:state.risk,updatedAt:nowISO()}));
+app.post("/api/paper/reset", (req,res)=>{
+  state.paper={startingCapital:100000,cash:100000,positions:[],orders:[],realizedPnl:0};
+  saveState(); res.json({ok:true,paper:state.paper});
+});
+app.post("/api/paper/order", (req,res)=>{
+  try {
+    const b=req.body||{};
+    const side=String(b.side||"BUY").toUpperCase()==="SELL"?"SELL":"BUY";
+    const qty=Math.max(1,Math.floor(Number(b.quantity||1)));
+    const price=Number(b.price||b.entry||0);
+    if (!price || price<=0) return res.status(400).json({ok:false,error:"Valid order price is required."});
+    if (state.risk.killSwitch) return res.status(403).json({ok:false,error:"ERA risk kill switch is ON."});
+    const value=price*qty;
+    if (side==="BUY" && value>state.paper.cash) return res.status(400).json({ok:false,error:"Insufficient paper cash."});
+    const positionKey=[b.index,b.optionType,b.strike,b.instrumentKey].join("|");
+    if (side==="BUY") {
+      state.paper.cash-=value;
+      state.paper.positions.push({id:`P${Date.now()}`,index:b.index||"NIFTY",optionType:b.optionType||"",strike:Number(b.strike||0),instrumentKey:b.instrumentKey||null,quantity:qty,entry:price,currentPrice:price,stopLoss:Number(b.stopLoss||0),target:Number(b.target||0),openedAt:nowISO()});
+    } else {
+      const pos=state.paper.positions.find(p=>[p.index,p.optionType,p.strike,p.instrumentKey].join("|")===positionKey);
+      if (!pos) return res.status(400).json({ok:false,error:"Matching paper position not found."});
+      const closeQty=Math.min(qty,pos.quantity); const pnl=(price-pos.entry)*closeQty; state.paper.cash+=price*closeQty; state.paper.realizedPnl+=pnl; pos.quantity-=closeQty; if(pos.quantity<=0) state.paper.positions=state.paper.positions.filter(x=>x.id!==pos.id);
+    }
+    const order={id:`O${Date.now()}`,side,index:b.index||"NIFTY",optionType:b.optionType||"",strike:Number(b.strike||0),quantity:qty,price,createdAt:nowISO()};
+    state.paper.orders.unshift(order); state.paper.orders=state.paper.orders.slice(0,200); saveState();
+    res.json({ok:true,order,paper:state.paper});
+  } catch(error){res.status(400).json({ok:false,error:apiError(error)});}
+});
+
+app.post("/api/paper/mark", (req,res)=>{
+  try {
+    for (const p of state.paper.positions) {
+      const m=state.market[p.index];
+      if (p.instrumentKey && Number.isFinite(Number(req.body?.prices?.[p.instrumentKey]))) p.currentPrice=Number(req.body.prices[p.instrumentKey]);
+      else if (p.optionLtp !== undefined) p.currentPrice=Number(p.optionLtp);
+      if (p.stopLoss && p.currentPrice<=p.stopLoss) p.status="STOP_RISK";
+      else if (p.target && p.currentPrice>=p.target) p.status="TARGET_REACHED";
+      else p.status="OPEN";
+    }
+    saveState(); res.json({ok:true,paper:state.paper});
+  } catch(error){res.status(400).json({ok:false,error:apiError(error)});}
+});
+
+app.get("/api/journal", (req,res)=>res.json({ok:true,journal:state.journal.slice(0,500)}));
+app.post("/api/journal", (req,res)=>{
+  try {
+    const b=req.body||{}; const record={id:b.id||`J${Date.now()}`,createdAt:b.createdAt||nowISO(),...b};
+    state.journal.unshift(record); state.journal=state.journal.slice(0,500); saveState(); res.json({ok:true,record,journal:state.journal});
+  } catch(error){res.status(400).json({ok:false,error:apiError(error)});}
+});
+
+app.get("/api/events", (req,res)=>res.json({ok:true,events:[],message:"No external economic-calendar provider is configured. ERA will not invent event data.",updatedAt:nowISO()}));
+
+app.post("/api/calculator", (req,res)=>{
+  try {
+    const b=req.body||{}; const entry=Number(b.entry||0), stop=Number(b.stop||0), target=Number(b.target||0), capital=Number(b.capital||100000), riskPct=Number(b.riskPct||1), qty=Math.max(1,Math.floor(Number(b.qty||1)));
+    const riskPerUnit=Math.abs(entry-stop), capitalRisk=capital*(riskPct/100), suggestedQty=riskPerUnit>0?Math.max(1,Math.floor(capitalRisk/riskPerUnit)):0;
+    const rr=riskPerUnit>0?Math.abs(target-entry)/riskPerUnit:0;
+    const pnl=Number.isFinite(target-entry)?(target-entry)*qty:0;
+    res.json({ok:true,entry,stop,target,capital,riskPct,riskPerUnit,capitalRisk,suggestedQty,rr,pnl,updatedAt:nowISO()});
+  } catch(error){res.status(400).json({ok:false,error:apiError(error)});}
+});
+
+app.post("/api/backtest", async (req,res)=>{
+  try {
+    const index=normalizeIndex(req.body?.index||"NIFTY"); const interval=Math.max(1,Math.min(60,Number(req.body?.interval||5)));
+    if(!INDICES[index]) return res.status(400).json({ok:false,error:"Invalid index"});
+    let candles=await fetchHistoricalCandles(index,interval); if(candles.length<30) candles=await fetchIntradayCandles(index,interval);
+    if(candles.length<30) return res.status(400).json({ok:false,error:"Not enough candle data for backtest."});
+    const closes=candles.map(c=>Number(c[4])); const trades=[]; let equity=Number(req.body?.capital||100000), peak=equity, maxDD=0;
+    for(let i=25;i<candles.length-1;i++){
+      const ema9=ema(closes.slice(0,i+1),9), ema20=ema(closes.slice(0,i+1),20), r=rsi(closes.slice(0,i+1),14); if(ema9===null||ema20===null||r===null) continue;
+      const up=ema9>ema20 && r>=52, down=ema9<ema20 && r<=48; if(!up&&!down) continue;
+      const entry=closes[i], exit=closes[i+1], pnl=up?exit-entry:entry-exit; equity+=pnl; peak=Math.max(peak,equity); maxDD=Math.max(maxDD,peak-equity); trades.push({time:candles[i][0],side:up?"BUY":"SELL",entry,exit,pnl});
+    }
+    const wins=trades.filter(t=>t.pnl>0), losses=trades.filter(t=>t.pnl<=0); const grossWin=wins.reduce((s,t)=>s+t.pnl,0), grossLoss=Math.abs(losses.reduce((s,t)=>s+t.pnl,0));
+    res.json({ok:true,index,interval,capital:Number(req.body?.capital||100000),endingCapital:round(equity),netPnl:round(equity-Number(req.body?.capital||100000)),trades:trades.length,winRate:trades.length?round(wins.length/trades.length*100):0,maxDrawdown:round(maxDD),profitFactor:grossLoss?round(grossWin/grossLoss):null,history:trades.slice(-100),dataWindow:trades.length?{from:trades[0].time,to:trades[trades.length-1].time}:null,updatedAt:nowISO()});
+  } catch(error){res.status(500).json({ok:false,error:apiError(error)});}
+});
+
+app.get("/api/alerts", (req,res)=>res.json({ok:true,alerts:state.alerts.slice(0,200),updatedAt:nowISO()}));
+app.post("/api/alerts", (req,res)=>{
+  try { const b=req.body||{}; const alert={id:b.id||`A${Date.now()}`,createdAt:nowISO(),active:true,...b}; state.alerts.unshift(alert); state.alerts=state.alerts.slice(0,200); saveState(); res.json({ok:true,alert}); }
+  catch(error){res.status(400).json({ok:false,error:apiError(error)});}
+});
 
 // ============================================================
 // PRE-MARKET CHECK
