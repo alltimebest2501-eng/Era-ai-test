@@ -3009,6 +3009,20 @@ async function analyzeIndex(
         chain.data
       );
 
+    // Volume fallback only: when index/candle volume is unavailable, use
+    // actual CE+PE traded volume from the option chain. No other logic is changed.
+    if (
+      (!Number.isFinite(Number(technical.volume)) || Number(technical.volume) <= 0) &&
+      optionRows.length
+    ) {
+      const optionVolume = optionRows.reduce((sum, row) => {
+        const ce = Number(row?.call?.volume || 0);
+        const pe = Number(row?.put?.volume || 0);
+        return sum + (Number.isFinite(ce) && ce > 0 ? ce : 0) + (Number.isFinite(pe) && pe > 0 ? pe : 0);
+      }, 0);
+      if (optionVolume > 0) technical.volume = optionVolume;
+    }
+
     if (
       optionRows.length
     ) {
