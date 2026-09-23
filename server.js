@@ -16,6 +16,35 @@ const VERSION = "8.2.5";
 
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
+// ============================================================
+// PWA ROOT FILES
+// ============================================================
+app.get("/manifest.json", (req, res) => {
+  const file = path.join(__dirname, "manifest.json");
+  if (fs.existsSync(file)) return res.sendFile(file);
+  return res.status(404).send("manifest.json not found");
+});
+
+app.get("/sw.js", (req, res) => {
+  const file = path.join(__dirname, "sw.js");
+  if (fs.existsSync(file)) {
+    res.type("application/javascript");
+    return res.sendFile(file);
+  }
+  return res.status(404).send("sw.js not found");
+});
+
+app.get("/icon-192.png", (req, res) => {
+  const file = path.join(__dirname, "icon-192.png");
+  if (fs.existsSync(file)) return res.sendFile(file);
+  return res.status(404).send("icon-192.png not found");
+});
+
+app.get("/icon-512.png", (req, res) => {
+  const file = path.join(__dirname, "icon-512.png");
+  if (fs.existsSync(file)) return res.sendFile(file);
+  return res.status(404).send("icon-512.png not found");
+});
 
 // Serve the test UI from the root index.html shipped with this package.
 // This avoids accidentally serving an older public/index.html from a previous deploy.
