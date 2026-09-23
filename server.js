@@ -602,6 +602,48 @@ async function upstoxRequest(
 // MARKET QUOTE V3
 // ============================================================
 
+async function fetchOptionMarketQuotes(instrumentKeys = []) {
+  const keys = [...new Set((instrumentKeys || []).filter(Boolean))];
+  if (!keys.length) return {};
+  const response = await upstoxRequest(
+    "https://api.upstox.com/v3/market-quote/quotes",
+    { instrument_key: keys.join(",") }
+  );
+  return response.data || {};
+}
+
+function findOptionQuote(rawData, instrumentKey) {
+  if (!rawData || !instrumentKey) return null;
+  if (rawData[instrumentKey]) return rawData[instrumentKey];
+  for (const [key, value] of Object.entries(rawData)) {
+    if (key === instrumentKey || value?.instrument_key === instrumentKey || value?.instrumentKey === instrumentKey) return value;
+  }
+  return null;
+}
+
+async function refreshPaperPositions() {
+  const positions = Array.isArray(state.paper.positions) ? state.paper.positions : [];
+  const keys = positions.map(p => p.instrumentKey).filter(Boolean);
+  let quotes = {};
+  try { quotes = await fetchOptionMarketQuotes(keys); } catch (_) {}
+  let unrealized = 0;
+  for (const p of positions) {
+    const q = findOptionQuote(quotes, p.instrumentKey);
+    const ltp = Number(q?.ltpc?.ltp ?? q?.ltp ?? q?.last_price ?? q?.lastPrice);
+    if (Number.isFinite(ltp) && ltp > 0) p.currentPrice = ltp;
+    const entry = Number(p.entry || 0), current = Number(p.currentPrice || entry), qty = Number(p.quantity || 0);
+    p.unrealizedPnl = (current - entry) * qty;
+    unrealized += p.unrealizedPnl;
+    if (p.stopLoss && current <= Number(p.stopLoss)) p.status = "STOP_RISK";
+    else if (p.target && current >= Number(p.target)) p.status = "TARGET_REACHED";
+    else p.status = "OPEN";
+    p.lastMarkedAt = nowISO();
+  }
+  state.paper.unrealizedPnl = unrealized;
+  saveState();
+  return state.paper;
+}
+
 async function fetchFullMarketQuotes() {
   const instrumentKeys =
     Object.values(INDICES)
@@ -4959,48 +5001,54 @@ app.post("/api/risk", (req,res)=>{
   } catch(error){res.status(400).json({ok:false,error:apiError(error)});}
 });
 
-app.get("/api/paper", (req,res)=>res.json({ok:true,paper:state.paper,risk:state.risk,updatedAt:nowISO()}));
+app.get("/api/paper", async (req,res)=>{
+  try { await refreshPaperPositions(); res.json({ok:true,paper:state.paper,risk:state.risk,updatedAt:nowISO()}); }
+  catch(error){ res.status(500).json({ok:false,error:apiError(error),paper:state.paper,risk:state.risk}); }
+});
+app.post("/api/paper/refresh", async (req,res)=>{
+  try { await refreshPaperPositions(); res.json({ok:true,paper:state.paper,risk:state.risk,updatedAt:nowISO()}); }
+  catch(error){ res.status(500).json({ok:false,error:apiError(error),paper:state.paper,risk:state.risk}); }
+});
 app.post("/api/paper/reset", (req,res)=>{
-  state.paper={startingCapital:100000,cash:100000,positions:[],orders:[],realizedPnl:0};
+  state.paper={startingCapital:100000,cash:100000,positions:[],orders:[],realizedPnl:0,unrealizedPnl:0};
   saveState(); res.json({ok:true,paper:state.paper});
 });
-app.post("/api/paper/order", (req,res)=>{
+app.post("/api/paper/order", async (req,res)=>{
   try {
     const b=req.body||{};
-    const side=String(b.side||"BUY").toUpperCase()==="SELL"?"SELL":"BUY";
+    const side=String(b.side||"BUY").toUpperCase();
+    if(side==="SELL" && b.positionId){
+      const pos=state.paper.positions.find(p=>p.id===b.positionId);
+      if(!pos) return res.status(404).json({ok:false,error:"Paper position not found."});
+      const price=Number(b.price||pos.currentPrice||pos.entry);
+      if(!(price>0)) return res.status(400).json({ok:false,error:"Valid exit price required."});
+      const pnl=(price-Number(pos.entry||0))*Number(pos.quantity||0);
+      state.paper.cash += price*Number(pos.quantity||0);
+      state.paper.realizedPnl += pnl;
+      const order={id:`O${Date.now()}`,createdAt:nowISO(),side:"SELL",positionId:pos.id,index:pos.index,optionType:pos.optionType,strike:pos.strike,price,quantity:pos.quantity};
+      state.paper.orders.unshift(order); state.paper.orders=state.paper.orders.slice(0,200);
+      state.paper.positions=state.paper.positions.filter(x=>x.id!==pos.id);
+      await refreshPaperPositions();
+      return res.json({ok:true,order,paper:state.paper});
+    }
+    if(side!=="BUY") return res.status(400).json({ok:false,error:"Use BUY or SELL with a positionId."});
     const qty=Math.max(1,Math.floor(Number(b.quantity||1)));
     const price=Number(b.price||b.entry||0);
     if (!price || price<=0) return res.status(400).json({ok:false,error:"Valid order price is required."});
+    if (!b.instrumentKey) return res.status(400).json({ok:false,error:"Select an exact option strike first."});
     if (state.risk.killSwitch) return res.status(403).json({ok:false,error:"ERA risk kill switch is ON."});
     const value=price*qty;
-    if (side==="BUY" && value>state.paper.cash) return res.status(400).json({ok:false,error:"Insufficient paper cash."});
-    const positionKey=[b.index,b.optionType,b.strike,b.instrumentKey].join("|");
-    if (side==="BUY") {
-      state.paper.cash-=value;
-      state.paper.positions.push({id:`P${Date.now()}`,index:b.index||"NIFTY",optionType:b.optionType||"",strike:Number(b.strike||0),instrumentKey:b.instrumentKey||null,quantity:qty,entry:price,currentPrice:price,stopLoss:Number(b.stopLoss||0),target:Number(b.target||0),openedAt:nowISO()});
-    } else {
-      const pos=state.paper.positions.find(p=>[p.index,p.optionType,p.strike,p.instrumentKey].join("|")===positionKey);
-      if (!pos) return res.status(400).json({ok:false,error:"Matching paper position not found."});
-      const closeQty=Math.min(qty,pos.quantity); const pnl=(price-pos.entry)*closeQty; state.paper.cash+=price*closeQty; state.paper.realizedPnl+=pnl; pos.quantity-=closeQty; if(pos.quantity<=0) state.paper.positions=state.paper.positions.filter(x=>x.id!==pos.id);
-    }
-    const order={id:`O${Date.now()}`,side,index:b.index||"NIFTY",optionType:b.optionType||"",strike:Number(b.strike||0),quantity:qty,price,createdAt:nowISO()};
+    if (value>state.paper.cash) return res.status(400).json({ok:false,error:"Insufficient paper cash."});
+    state.paper.cash-=value;
+    state.paper.positions.push({id:`P${Date.now()}`,index:b.index||"NIFTY",optionType:b.optionType||"",strike:Number(b.strike||0),expiry:b.expiry||null,instrumentKey:b.instrumentKey,quantity:qty,entry:price,currentPrice:price,stopLoss:Number(b.stopLoss||0),target:Number(b.target||0),entryMode:b.entryMode||"market",openedAt:nowISO(),unrealizedPnl:0,status:"OPEN"});
+    const order={id:`O${Date.now()}`,side:"BUY",index:b.index||"NIFTY",optionType:b.optionType||"",strike:Number(b.strike||0),expiry:b.expiry||null,instrumentKey:b.instrumentKey,quantity:qty,price,entryMode:b.entryMode||"market",createdAt:nowISO()};
     state.paper.orders.unshift(order); state.paper.orders=state.paper.orders.slice(0,200); saveState();
     res.json({ok:true,order,paper:state.paper});
   } catch(error){res.status(400).json({ok:false,error:apiError(error)});}
 });
-
-app.post("/api/paper/mark", (req,res)=>{
-  try {
-    for (const p of state.paper.positions) {
-      const m=state.market[p.index];
-      if (p.instrumentKey && Number.isFinite(Number(req.body?.prices?.[p.instrumentKey]))) p.currentPrice=Number(req.body.prices[p.instrumentKey]);
-      else if (p.optionLtp !== undefined) p.currentPrice=Number(p.optionLtp);
-      if (p.stopLoss && p.currentPrice<=p.stopLoss) p.status="STOP_RISK";
-      else if (p.target && p.currentPrice>=p.target) p.status="TARGET_REACHED";
-      else p.status="OPEN";
-    }
-    saveState(); res.json({ok:true,paper:state.paper});
-  } catch(error){res.status(400).json({ok:false,error:apiError(error)});}
+app.post("/api/paper/mark", async (req,res)=>{
+  try { await refreshPaperPositions(); res.json({ok:true,paper:state.paper}); }
+  catch(error){res.status(400).json({ok:false,error:apiError(error)});}
 });
 
 app.get("/api/journal", (req,res)=>res.json({ok:true,journal:state.journal.slice(0,500)}));
