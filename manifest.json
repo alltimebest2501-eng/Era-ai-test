@@ -1,6 +1,7 @@
 {
   "name": "ERA AI — Market Intelligence",
   "short_name": "ERA AI",
+  "id": "/",
   "description": "ERA AI autonomous Indian market intelligence and options analysis platform.",
   "start_url": "https://era-ai-test.onrender.com/",
   "scope": "/",
