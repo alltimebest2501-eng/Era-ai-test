@@ -12,7 +12,7 @@ const path = require("path");
 const app = express();
 
 const PORT = process.env.PORT || 10000;
-const VERSION = "8.2.6";
+const VERSION = "8.2.7";
 
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
@@ -263,11 +263,15 @@ const state = {
 
   previousSignals: {},
 
+  // Confidence/structure snapshots are intentionally not recalculated on every 5m candle.
+  // They refresh on a 15-minute decision window or when the market direction changes.
+  decisionSnapshots: {},
+
   notificationHistory: {},
 
   settings: {
     movementThreshold: 20,
-    minConfidence: 60,
+    minConfidence: 66,
     scanIntervalMs: 60000,
     newsIntervalMs: 300000,
     notificationCooldownMs: 15 * 60 * 1000,
@@ -1584,121 +1588,50 @@ function calculateVWAP(
 function detectStructure(
   candles
 ) {
-  if (
-    !Array.isArray(candles) ||
-    candles.length < 10
-  ) {
+  if (!Array.isArray(candles) || candles.length < 20) {
     return {
       label: "RANGE",
+      trend: "RANGE",
       bos: false,
       choch: false,
       details: null
     };
   }
 
-  const recent =
-    candles.slice(-10);
+  // Use a wider confirmed structure window instead of the last two tiny
+  // candle groups. This prevents the UI from flipping UP/DOWN every 5m candle.
+  const recent = candles.slice(-12);
+  const previous = candles.slice(-24, -12);
 
-  const previous =
-    candles.slice(-20, -10);
+  const recentHigh = Math.max(...recent.map(c => Number(c[2])).filter(Number.isFinite));
+  const recentLow = Math.min(...recent.map(c => Number(c[3])).filter(Number.isFinite));
+  const previousHigh = Math.max(...previous.map(c => Number(c[2])).filter(Number.isFinite));
+  const previousLow = Math.min(...previous.map(c => Number(c[3])).filter(Number.isFinite));
+  const lastClose = Number(candles[candles.length - 1][4]);
 
-  const recentHigh =
-    Math.max(
-      ...recent.map(
-        c => Number(c[2])
-      )
-    );
-
-  const recentLow =
-    Math.min(
-      ...recent.map(
-        c => Number(c[3])
-      )
-    );
-
-  const previousHigh =
-    previous.length
-      ? Math.max(
-          ...previous.map(
-            c => Number(c[2])
-          )
-        )
-      : recentHigh;
-
-  const previousLow =
-    previous.length
-      ? Math.min(
-          ...previous.map(
-            c => Number(c[3])
-          )
-        )
-      : recentLow;
-
-  let label =
-    "RANGE";
-
-  if (
-    recentHigh >
-      previousHigh &&
-    recentLow >
-      previousLow
-  ) {
-    label =
-      "HH_HL";
-  } else if (
-    recentHigh <
-      previousHigh &&
-    recentLow <
-      previousLow
-  ) {
-    label =
-      "LH_LL";
+  let label = "RANGE";
+  let trend = "RANGE";
+  if (recentHigh > previousHigh && recentLow > previousLow) {
+    label = "HH_HL";
+    trend = "BULLISH";
+  } else if (recentHigh < previousHigh && recentLow < previousLow) {
+    label = "LH_LL";
+    trend = "BEARISH";
   }
 
-  const lastClose =
-    Number(
-      candles[
-        candles.length - 1
-      ][4]
-    );
-
-  const bosUp =
-    lastClose >
-    previousHigh;
-
-  const bosDown =
-    lastClose <
-    previousLow;
+  const bosUp = lastClose > previousHigh;
+  const bosDown = lastClose < previousLow;
 
   return {
     label,
-
-    bos:
-      bosUp ||
-      bosDown,
-
-    choch:
-      (
-        label === "HH_HL" &&
-        bosDown
-      ) ||
-      (
-        label === "LH_LL" &&
-        bosUp
-      ),
-
+    trend,
+    bos: bosUp || bosDown,
+    choch: (label === "HH_HL" && bosDown) || (label === "LH_LL" && bosUp),
     details: {
-      recentHigh:
-        round(recentHigh),
-
-      recentLow:
-        round(recentLow),
-
-      previousHigh:
-        round(previousHigh),
-
-      previousLow:
-        round(previousLow)
+      recentHigh: round(recentHigh),
+      recentLow: round(recentLow),
+      previousHigh: round(previousHigh),
+      previousLow: round(previousLow)
     }
   };
 }
@@ -1897,6 +1830,9 @@ function technicalAnalysis(
 
     structure:
       structure.label,
+
+    structureTrend:
+      structure.trend,
 
     structureDetails:
       structure.details,
@@ -2791,7 +2727,7 @@ function calculateConfidence(
       95
     );
 
-  const tradeMinConfidence = 61;
+  const tradeMinConfidence = 66;
   let suggestion;
 
   if (
@@ -2850,13 +2786,19 @@ function createOptionTrades(
 
   if (
     confidenceData.confidence <
-    61
+    66
   ) {
     return [];
   }
 
   const direction =
     movement.direction;
+
+  // Never reuse a frozen confidence snapshot for the opposite live direction.
+  // Wait for the next decision window instead of flipping confidence candle-by-candle.
+  if (confidenceData.direction && confidenceData.direction !== direction) {
+    return [];
+  }
 
   const optionType =
     direction === "UP"
@@ -3000,9 +2942,44 @@ function createOptionTrades(
     });
   }
 
-  return trades
-    .filter(t => Number(t?.confidence || 0) > 60)
-    .slice(0, 3);
+  // Publish every validated setup above 65%; do not arbitrarily truncate to 3 trades.
+  return trades.filter(t => Number(t?.confidence || 0) > 65);
+}
+
+// ============================================================
+// STABLE DECISION SNAPSHOT
+// ============================================================
+
+function getStableDecision(index, computed, movement, technical) {
+  const now = Date.now();
+  const key = index;
+  const previous = state.decisionSnapshots[key];
+  const direction = movement?.direction || "NONE";
+  const structure = technical?.structureTrend || technical?.trend || "RANGE";
+  const stale = !previous || (now - Number(previous.updatedAt || 0)) >= 15 * 60 * 1000;
+  // A confidence value is a decision snapshot, not a tick-by-tick score.
+  // Refresh only on the 15-minute decision window. This stops 5m candles from
+  // constantly rewriting the published confidence. A direction mismatch is
+  // handled by the trade gate below rather than by changing confidence early.
+  if (!previous || stale) {
+    const snapshot = {
+      confidence: Number(computed.confidence),
+      suggestion: computed.suggestion,
+      reasons: computed.reasons,
+      risks: computed.risks,
+      direction,
+      structure,
+      updatedAt: now
+    };
+    state.decisionSnapshots[key] = snapshot;
+    return snapshot;
+  }
+
+  return {
+    ...previous,
+    // Keep the original decision confidence/reasons stable between windows.
+    suggestion: previous.confidence >= 66 ? "TRADE CONSIDER" : previous.suggestion
+  };
 }
 
 // ============================================================
@@ -3178,13 +3155,20 @@ async function analyzeIndex(
     }
   }
 
-  const confidenceData =
+  const computedConfidence =
     calculateConfidence(
       market,
       technical,
       movement,
       optionSummary
     );
+
+  const confidenceData = getStableDecision(
+    index,
+    computedConfidence,
+    movement,
+    technical
+  );
 
   const trades =
     createOptionTrades(
@@ -3241,6 +3225,13 @@ async function analyzeIndex(
 
     confidence:
       confidenceData.confidence,
+
+    decision:
+      {
+        direction: confidenceData.direction || movement.direction,
+        structure: confidenceData.structure || technical.structureTrend || technical.trend || "RANGE",
+        updatedAt: confidenceData.updatedAt || Date.now()
+      },
 
     reasons:
       confidenceData.reasons,
@@ -5013,7 +5004,7 @@ app.get("/api/opportunities", async (req, res) => {
     for (const index of Object.keys(INDICES)) {
       const a = state.analysis[index];
       if (!a?.available) continue;
-      for (const trade of (a.trades || [])) list.push({ ...trade, reasons:a.reasons || [], risks:a.risks || [] });
+      for (const trade of (a.trades || [])) { if (Number(trade?.confidence || 0) > 65) list.push({ ...trade, reasons:a.reasons || [], risks:a.risks || [] }); }
       if (!a.trades?.length) list.push({ index, signal:"NO TRADE", status:"WATCH", confidence:a.confidence || 0, reason:a.suggestion || "No validated setup" });
     }
     list.sort((a,b)=>Number(b.confidence||0)-Number(a.confidence||0));
@@ -5086,8 +5077,11 @@ app.post("/api/paper/order", (req,res)=>{
       state.paper.cash-=value;
       state.paper.positions.push({id:`P${Date.now()}`,index:b.index||"NIFTY",optionType:b.optionType||"",strike:Number(b.strike||0),instrumentKey:b.instrumentKey||null,quantity:qty,entry:price,currentPrice:price,stopLoss:Number(b.stopLoss||0),target:Number(b.target||0),openedAt:nowISO()});
     } else {
-      const pos=state.paper.positions.find(p=>[p.index,p.optionType,p.strike,p.instrumentKey].join("|")===positionKey);
-      if (!pos) return res.status(400).json({ok:false,error:"Matching paper position not found."});
+      const pos=state.paper.positions.find(p=>
+        (b.positionId && p.id === b.positionId) ||
+        [p.index,p.optionType,p.strike,p.instrumentKey].join("|")===positionKey
+      );
+      if (!pos) return res.status(400).json({ok:false,error:"Paper position not found or already closed."});
       const closeQty=Math.min(qty,pos.quantity); const pnl=(price-pos.entry)*closeQty; state.paper.cash+=price*closeQty; state.paper.realizedPnl+=pnl; pos.quantity-=closeQty; if(pos.quantity<=0) state.paper.positions=state.paper.positions.filter(x=>x.id!==pos.id);
     }
     const order={id:`O${Date.now()}`,side,index:b.index||"NIFTY",optionType:b.optionType||"",strike:Number(b.strike||0),quantity:qty,price,createdAt:nowISO()};
