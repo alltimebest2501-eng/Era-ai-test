@@ -4991,7 +4991,7 @@ app.get("/api/candles", async (req, res) => {
     if (!candles.length) candles = await fetchHistoricalCandles(index, interval);
     const market = state.market[index];
     candles = syncLatestCandle(candles, market?.price);
-    res.json({ ok:true, index, interval, candles, updatedAt:nowISO() });
+    res.json({ ok:true, index, interval, candles, volume: Number(market?.volume || 0), volumeSource: Number(market?.volume || 0) > 0 ? "quote" : (candles.some(c => Number(c?.[5] || 0) > 0) ? "candle" : "unavailable"), updatedAt:nowISO() });
   } catch (error) {
     res.status(500).json({ ok:false, error:apiError(error) });
   }
