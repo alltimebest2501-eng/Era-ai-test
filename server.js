@@ -3197,6 +3197,21 @@ async function analyzeIndex(
       optionSummary
     );
 
+  // Index instruments themselves may not expose traded volume. When that
+  // happens, use aggregate CE+PE option-chain volume as the market-activity
+  // fallback so the ERA dashboard does not remain stuck at 0.
+  if (!(Number(technical.volume) > 0) && Array.isArray(optionRows) && optionRows.length) {
+    const optionVolume = optionRows.reduce((sum, row) => {
+      const ce = Number(row?.call?.volume || 0);
+      const pe = Number(row?.put?.volume || 0);
+      return sum + (Number.isFinite(ce) && ce > 0 ? ce : 0) + (Number.isFinite(pe) && pe > 0 ? pe : 0);
+    }, 0);
+    if (optionVolume > 0) {
+      technical.volume = Math.round(optionVolume);
+      technical.volumeSource = "options-chain-activity";
+    }
+  }
+
   const trades =
     createOptionTrades(
       index,
