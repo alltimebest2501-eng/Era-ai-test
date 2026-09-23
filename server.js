@@ -265,6 +265,12 @@ const state = {
 
   notificationHistory: {},
 
+  previousVolumes: {},
+
+  previousOI: {},
+
+  runtimeMarketOpen: null,
+
   settings: {
     movementThreshold: 20,
     minConfidence: 60,
@@ -272,11 +278,20 @@ const state = {
     newsIntervalMs: 300000,
     notificationCooldownMs: 15 * 60 * 1000,
     notifications: {
-      marketOpen: true,
-      movement: true,
       tradeSetup: true,
+      priceAlert: true,
+      breakout: true,
+      breakdown: true,
+      volumeSpike: true,
+      oiChange: true,
       news: true,
-      marketClose: true
+      slHit: true,
+      targetHit: true,
+      marketOpen: true,
+      marketClose: true,
+      apiError: true,
+      riskWarning: true,
+      movement: true
     }
   },
 
@@ -601,48 +616,6 @@ async function upstoxRequest(
 // ============================================================
 // MARKET QUOTE V3
 // ============================================================
-
-async function fetchOptionMarketQuotes(instrumentKeys = []) {
-  const keys = [...new Set((instrumentKeys || []).filter(Boolean))];
-  if (!keys.length) return {};
-  const response = await upstoxRequest(
-    "https://api.upstox.com/v3/market-quote/quotes",
-    { instrument_key: keys.join(",") }
-  );
-  return response.data || {};
-}
-
-function findOptionQuote(rawData, instrumentKey) {
-  if (!rawData || !instrumentKey) return null;
-  if (rawData[instrumentKey]) return rawData[instrumentKey];
-  for (const [key, value] of Object.entries(rawData)) {
-    if (key === instrumentKey || value?.instrument_key === instrumentKey || value?.instrumentKey === instrumentKey) return value;
-  }
-  return null;
-}
-
-async function refreshPaperPositions() {
-  const positions = Array.isArray(state.paper.positions) ? state.paper.positions : [];
-  const keys = positions.map(p => p.instrumentKey).filter(Boolean);
-  let quotes = {};
-  try { quotes = await fetchOptionMarketQuotes(keys); } catch (_) {}
-  let unrealized = 0;
-  for (const p of positions) {
-    const q = findOptionQuote(quotes, p.instrumentKey);
-    const ltp = Number(q?.ltpc?.ltp ?? q?.ltp ?? q?.last_price ?? q?.lastPrice);
-    if (Number.isFinite(ltp) && ltp > 0) p.currentPrice = ltp;
-    const entry = Number(p.entry || 0), current = Number(p.currentPrice || entry), qty = Number(p.quantity || 0);
-    p.unrealizedPnl = (current - entry) * qty;
-    unrealized += p.unrealizedPnl;
-    if (p.stopLoss && current <= Number(p.stopLoss)) p.status = "STOP_RISK";
-    else if (p.target && current >= Number(p.target)) p.status = "TARGET_REACHED";
-    else p.status = "OPEN";
-    p.lastMarkedAt = nowISO();
-  }
-  state.paper.unrealizedPnl = unrealized;
-  saveState();
-  return state.paper;
-}
 
 async function fetchFullMarketQuotes() {
   const instrumentKeys =
@@ -3341,6 +3314,95 @@ async function sendPush(
 }
 
 // ============================================================
+// NOTIFICATION EVENT CENTER
+// ============================================================
+
+async function notifyEvent(type, title, body, data = {}, options = {}) {
+  const key = String(type || "event");
+  if (state.settings.notifications?.[key] === false) return false;
+
+  const fingerprint = String(options.fingerprint || `${key}:${title}:${body}`).slice(0, 500);
+  const cooldownMs = Number(options.cooldownMs || state.settings.notificationCooldownMs || 900000);
+  const last = Number(state.notificationHistory[`event:${fingerprint}`] || 0);
+  if (last && Date.now() - last < cooldownMs) return false;
+
+  state.notificationHistory[`event:${fingerprint}`] = Date.now();
+  const alert = {
+    id: `${Date.now()}-${Math.random().toString(36).slice(2,8)}`,
+    type: key.toUpperCase(),
+    title,
+    body,
+    data,
+    createdAt: nowISO()
+  };
+  state.alerts.unshift(alert);
+  state.alerts = state.alerts.slice(0, 200);
+  saveState();
+  await sendPush({ title, body, data: { ...data, type: key } });
+  return true;
+}
+
+async function checkPriceAlerts() {
+  if (!Array.isArray(state.alerts)) return;
+  for (const alert of state.alerts.filter(a => a.active && a.price && a.index && !a.triggeredAt)) {
+    const market = state.market[normalizeIndex(alert.index)];
+    const trigger = Number(alert.price);
+    const current = Number(market?.price);
+    if (!Number.isFinite(current) || !Number.isFinite(trigger)) continue;
+    const direction = String(alert.direction || "ANY").toUpperCase();
+    const previous = Number(state.previousPrices[normalizeIndex(alert.index)]);
+    const crossed = Number.isFinite(previous) ? ((previous <= trigger && current >= trigger) || (previous >= trigger && current <= trigger)) : false;
+    const hit = direction === "ABOVE" ? current >= trigger : direction === "BELOW" ? current <= trigger : crossed || Math.abs(current - trigger) <= Math.max(0.05, Math.abs(trigger) * 0.001);
+    if (!hit) continue;
+    alert.triggeredAt = nowISO();
+    alert.active = false;
+    await notifyEvent("priceAlert", `ERA AI — ${alert.index} Price Alert`, `${alert.note || "Price alert triggered"} | ${round(current)}`, { index: alert.index, price: current, trigger });
+  }
+  saveState();
+}
+
+async function checkMarketEventNotifications() {
+  const open = isMarketHours();
+  if (state.runtimeMarketOpen === null) {
+    state.runtimeMarketOpen = open;
+    return;
+  }
+  if (open === state.runtimeMarketOpen) return;
+  state.runtimeMarketOpen = open;
+  if (open) {
+    await notifyEvent("marketOpen", "ERA AI — Market Open", "Indian market is open. ERA market intelligence is active.", { type: "MARKET_OPEN" }, { cooldownMs: 24 * 60 * 60 * 1000 });
+  } else {
+    await notifyEvent("marketClose", "ERA AI — Market Closed", "Indian market session has closed. Review your positions and journal.", { type: "MARKET_CLOSE" }, { cooldownMs: 24 * 60 * 60 * 1000 });
+  }
+}
+
+async function checkMarketMetricNotifications(index, market, movement) {
+  if (!market) return;
+  const volume = Number(market.volume);
+  const oi = Number(market.oi);
+  const previousVolume = Number(state.previousVolumes[index]);
+  const previousOI = Number(state.previousOI[index]);
+
+  if (Number.isFinite(volume) && Number.isFinite(previousVolume) && previousVolume > 0 && volume >= previousVolume * 1.5) {
+    await notifyEvent("volumeSpike", `ERA AI — ${index} Volume Spike`, `Volume increased sharply | ${volume.toLocaleString("en-IN")}`, { index, volume, previousVolume }, { fingerprint: `${index}:volume:${Math.floor(volume / previousVolume * 10)}` });
+  }
+  if (Number.isFinite(oi) && Number.isFinite(previousOI) && previousOI > 0) {
+    const pct = ((oi - previousOI) / previousOI) * 100;
+    if (Math.abs(pct) >= 5) {
+      await notifyEvent("oiChange", `ERA AI — ${index} OI Change`, `OI ${pct >= 0 ? "increased" : "decreased"} ${Math.abs(round(pct, 2))}%`, { index, oi, previousOI, changePercent: round(pct, 2) }, { fingerprint: `${index}:oi:${pct >= 0 ? "up" : "down"}:${Math.floor(Math.abs(pct))}` });
+    }
+  }
+  if (movement?.significant && movement.direction === "UP") {
+    await notifyEvent("breakout", `ERA AI — ${index} Breakout`, `${Math.abs(movement.points)} point upside move confirmed`, { index, movement }, { fingerprint: `${index}:breakout:${Math.floor(Math.abs(movement.points) / Math.max(1, Number(state.settings.movementThreshold || 20)))}` });
+  } else if (movement?.significant && movement.direction === "DOWN") {
+    await notifyEvent("breakdown", `ERA AI — ${index} Breakdown`, `${Math.abs(movement.points)} point downside move confirmed`, { index, movement }, { fingerprint: `${index}:breakdown:${Math.floor(Math.abs(movement.points) / Math.max(1, Number(state.settings.movementThreshold || 20)))}` });
+  }
+
+  if (Number.isFinite(volume)) state.previousVolumes[index] = volume;
+  if (Number.isFinite(oi)) state.previousOI[index] = oi;
+}
+
+// ============================================================
 // TRADE ALERT
 // ============================================================
 
@@ -3502,6 +3564,8 @@ async function monitorMarketState() {
 
   try {
     await refreshMarketData();
+    await checkMarketEventNotifications();
+    await checkPriceAlerts();
 
     if (
       !isMarketHours()
@@ -3534,6 +3598,7 @@ async function monitorMarketState() {
           analysis.movement,
           analysis.market
         );
+        await checkMarketMetricNotifications(index, analysis.market, analysis.movement);
 
         if (
           Array.isArray(
@@ -3556,6 +3621,7 @@ async function monitorMarketState() {
           error.response?.data ||
           error.message
         );
+        await notifyEvent("apiError", `ERA AI — ${index} API Error`, apiError(error), { index, error: apiError(error) }, { cooldownMs: 15 * 60 * 1000, fingerprint: `${index}:api:${apiError(error)}` });
       }
     }
 
@@ -3595,6 +3661,7 @@ async function monitorMarketState() {
       error.response?.data ||
       error.message
     );
+    await notifyEvent("apiError", "ERA AI — API Error", apiError(error), { error: apiError(error) }, { cooldownMs: 15 * 60 * 1000, fingerprint: `scanner:api:${apiError(error)}` });
 
   } finally {
     scannerBusy =
@@ -3632,6 +3699,7 @@ async function fetchNews() {
         /<item>[\s\S]*?<\/item>/g
       ) || [];
 
+    const previousNewsTitles = new Set((state.news || []).map(item => item.title));
     const news =
       items
         .slice(0, 20)
@@ -3692,6 +3760,11 @@ async function fetchNews() {
 
     state.news =
       news;
+
+    const fresh = news.find(item => item.title && !previousNewsTitles.has(item.title));
+    if (fresh && previousNewsTitles.size) {
+      await notifyEvent("news", "ERA AI — Market News", fresh.title, { link: fresh.link, pubDate: fresh.pubDate }, { fingerprint: `news:${fresh.title}` });
+    }
 
     state.lastNewsFetch =
       nowISO();
@@ -5001,54 +5074,55 @@ app.post("/api/risk", (req,res)=>{
   } catch(error){res.status(400).json({ok:false,error:apiError(error)});}
 });
 
-app.get("/api/paper", async (req,res)=>{
-  try { await refreshPaperPositions(); res.json({ok:true,paper:state.paper,risk:state.risk,updatedAt:nowISO()}); }
-  catch(error){ res.status(500).json({ok:false,error:apiError(error),paper:state.paper,risk:state.risk}); }
-});
-app.post("/api/paper/refresh", async (req,res)=>{
-  try { await refreshPaperPositions(); res.json({ok:true,paper:state.paper,risk:state.risk,updatedAt:nowISO()}); }
-  catch(error){ res.status(500).json({ok:false,error:apiError(error),paper:state.paper,risk:state.risk}); }
-});
+app.get("/api/paper", (req,res)=>res.json({ok:true,paper:state.paper,risk:state.risk,updatedAt:nowISO()}));
 app.post("/api/paper/reset", (req,res)=>{
-  state.paper={startingCapital:100000,cash:100000,positions:[],orders:[],realizedPnl:0,unrealizedPnl:0};
+  state.paper={startingCapital:100000,cash:100000,positions:[],orders:[],realizedPnl:0};
   saveState(); res.json({ok:true,paper:state.paper});
 });
 app.post("/api/paper/order", async (req,res)=>{
   try {
     const b=req.body||{};
-    const side=String(b.side||"BUY").toUpperCase();
-    if(side==="SELL" && b.positionId){
-      const pos=state.paper.positions.find(p=>p.id===b.positionId);
-      if(!pos) return res.status(404).json({ok:false,error:"Paper position not found."});
-      const price=Number(b.price||pos.currentPrice||pos.entry);
-      if(!(price>0)) return res.status(400).json({ok:false,error:"Valid exit price required."});
-      const pnl=(price-Number(pos.entry||0))*Number(pos.quantity||0);
-      state.paper.cash += price*Number(pos.quantity||0);
-      state.paper.realizedPnl += pnl;
-      const order={id:`O${Date.now()}`,createdAt:nowISO(),side:"SELL",positionId:pos.id,index:pos.index,optionType:pos.optionType,strike:pos.strike,price,quantity:pos.quantity};
-      state.paper.orders.unshift(order); state.paper.orders=state.paper.orders.slice(0,200);
-      state.paper.positions=state.paper.positions.filter(x=>x.id!==pos.id);
-      await refreshPaperPositions();
-      return res.json({ok:true,order,paper:state.paper});
-    }
-    if(side!=="BUY") return res.status(400).json({ok:false,error:"Use BUY or SELL with a positionId."});
+    const side=String(b.side||"BUY").toUpperCase()==="SELL"?"SELL":"BUY";
     const qty=Math.max(1,Math.floor(Number(b.quantity||1)));
     const price=Number(b.price||b.entry||0);
     if (!price || price<=0) return res.status(400).json({ok:false,error:"Valid order price is required."});
-    if (!b.instrumentKey) return res.status(400).json({ok:false,error:"Select an exact option strike first."});
-    if (state.risk.killSwitch) return res.status(403).json({ok:false,error:"ERA risk kill switch is ON."});
+    if (state.risk.killSwitch) { await notifyEvent("riskWarning", "ERA AI — Risk Warning", "Paper trading is blocked because the risk kill switch is ON.", { type:"RISK_WARNING" }, { cooldownMs: 15*60*1000, fingerprint:"risk:kill-switch" }); return res.status(403).json({ok:false,error:"ERA risk kill switch is ON."}); }
     const value=price*qty;
-    if (value>state.paper.cash) return res.status(400).json({ok:false,error:"Insufficient paper cash."});
-    state.paper.cash-=value;
-    state.paper.positions.push({id:`P${Date.now()}`,index:b.index||"NIFTY",optionType:b.optionType||"",strike:Number(b.strike||0),expiry:b.expiry||null,instrumentKey:b.instrumentKey,quantity:qty,entry:price,currentPrice:price,stopLoss:Number(b.stopLoss||0),target:Number(b.target||0),entryMode:b.entryMode||"market",openedAt:nowISO(),unrealizedPnl:0,status:"OPEN"});
-    const order={id:`O${Date.now()}`,side:"BUY",index:b.index||"NIFTY",optionType:b.optionType||"",strike:Number(b.strike||0),expiry:b.expiry||null,instrumentKey:b.instrumentKey,quantity:qty,price,entryMode:b.entryMode||"market",createdAt:nowISO()};
+    if (side==="BUY" && value>state.paper.cash) return res.status(400).json({ok:false,error:"Insufficient paper cash."});
+    const positionKey=[b.index,b.optionType,b.strike,b.instrumentKey].join("|");
+    if (side==="BUY") {
+      state.paper.cash-=value;
+      state.paper.positions.push({id:`P${Date.now()}`,index:b.index||"NIFTY",optionType:b.optionType||"",strike:Number(b.strike||0),instrumentKey:b.instrumentKey||null,quantity:qty,entry:price,currentPrice:price,stopLoss:Number(b.stopLoss||0),target:Number(b.target||0),openedAt:nowISO()});
+    } else {
+      const pos=state.paper.positions.find(p=>[p.index,p.optionType,p.strike,p.instrumentKey].join("|")===positionKey);
+      if (!pos) return res.status(400).json({ok:false,error:"Matching paper position not found."});
+      const closeQty=Math.min(qty,pos.quantity); const pnl=(price-pos.entry)*closeQty; state.paper.cash+=price*closeQty; state.paper.realizedPnl+=pnl; pos.quantity-=closeQty; if(pos.quantity<=0) state.paper.positions=state.paper.positions.filter(x=>x.id!==pos.id);
+    }
+    const order={id:`O${Date.now()}`,side,index:b.index||"NIFTY",optionType:b.optionType||"",strike:Number(b.strike||0),quantity:qty,price,createdAt:nowISO()};
     state.paper.orders.unshift(order); state.paper.orders=state.paper.orders.slice(0,200); saveState();
     res.json({ok:true,order,paper:state.paper});
   } catch(error){res.status(400).json({ok:false,error:apiError(error)});}
 });
+
 app.post("/api/paper/mark", async (req,res)=>{
-  try { await refreshPaperPositions(); res.json({ok:true,paper:state.paper}); }
-  catch(error){res.status(400).json({ok:false,error:apiError(error)});}
+  try {
+    for (const p of state.paper.positions) {
+      const m=state.market[p.index];
+      if (p.instrumentKey && Number.isFinite(Number(req.body?.prices?.[p.instrumentKey]))) p.currentPrice=Number(req.body.prices[p.instrumentKey]);
+      else if (p.optionLtp !== undefined) p.currentPrice=Number(p.optionLtp);
+      const previousStatus = p.status || "OPEN";
+      if (p.stopLoss && p.currentPrice<=p.stopLoss) p.status="STOP_RISK";
+      else if (p.target && p.currentPrice>=p.target) p.status="TARGET_REACHED";
+      else p.status="OPEN";
+      if (p.status !== previousStatus && p.status === "STOP_RISK") {
+        await notifyEvent("slHit", `ERA AI — ${p.index} Stop Loss Hit`, `${p.optionType || "POSITION"} ${p.strike || ""} | Current ₹${round(p.currentPrice)}`, { positionId:p.id, index:p.index, strike:p.strike, currentPrice:p.currentPrice }, { fingerprint:`sl:${p.id}` });
+      }
+      if (p.status !== previousStatus && p.status === "TARGET_REACHED") {
+        await notifyEvent("targetHit", `ERA AI — ${p.index} Target Hit`, `${p.optionType || "POSITION"} ${p.strike || ""} | Current ₹${round(p.currentPrice)}`, { positionId:p.id, index:p.index, strike:p.strike, currentPrice:p.currentPrice }, { fingerprint:`target:${p.id}` });
+      }
+    }
+    saveState(); res.json({ok:true,paper:state.paper});
+  } catch(error){res.status(400).json({ok:false,error:apiError(error)});}
 });
 
 app.get("/api/journal", (req,res)=>res.json({ok:true,journal:state.journal.slice(0,500)}));
