@@ -1902,7 +1902,11 @@ async function fetchOptionContracts(
       }
     );
 
-  return response.data || [];
+  const payload = response && response.data;
+  if (Array.isArray(payload)) return payload;
+  if (Array.isArray(payload?.data)) return payload.data;
+  if (Array.isArray(payload?.contracts)) return payload.contracts;
+  return [];
 }
 
 // ============================================================
@@ -1928,7 +1932,7 @@ async function findNearestExpiry(
         contracts
           .map(
             item =>
-              item.expiry
+              item.expiry || item.expiry_date || item.expiryDate
           )
           .filter(Boolean)
       )
@@ -1955,9 +1959,10 @@ app.get('/api/options/expiries', async (req, res) => {
     if (!INDICES[index]) return res.status(400).json({ ok:false, error:'Invalid index' });
     const contracts = await fetchOptionContracts(index);
     const today = new Date().toISOString().slice(0,10);
-    const expiries = [...new Set((contracts || []).map(x => x.expiry || x.expiry_date).filter(Boolean))]
+    const expiries = [...new Set((contracts || []).map(x => x.expiry || x.expiry_date || x.expiryDate).filter(Boolean))]
+      .map(x => String(x).slice(0,10))
       .filter(x => x >= today).sort();
-    res.json({ ok:true, index, expiries, nearest: expiries[0] || null, updatedAt: nowISO() });
+    res.json({ ok:true, index, expiries, nearest: expiries[0] || null, count: expiries.length, updatedAt: nowISO() });
   } catch (error) {
     console.error('[ERA] Option expiries endpoint:', error.response?.data || error.message);
     res.status(500).json({ ok:false, error: apiError(error) });
