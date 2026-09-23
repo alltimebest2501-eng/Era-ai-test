@@ -1,3 +1,4 @@
+// ERA AI Service Worker V8.2.6
 self.addEventListener('install', event => {
   event.waitUntil(self.skipWaiting());
 });
